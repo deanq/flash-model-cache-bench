@@ -12,6 +12,31 @@ make run       # deploy 4 endpoints -> benchmark -> report -> tear everything do
 
 The report lands in `runs/<run-id>/report.md` (raw trials in `results.jsonl`).
 
+## Results (2026-09-25, RTX 4090, EU-RO-1)
+
+Full reports: [`results/qwen3b/report.md`](results/qwen3b/report.md) (5 cold trials per strategy) and
+[`results/qwen7b/report.md`](results/qwen7b/report.md) (3 cold trials per strategy). All values are medians.
+
+| | Qwen2.5-3B (5.8 GiB) | Qwen2.5-7B (14.2 GiB) |
+|---|---|---|
+| **volume**: load straight off the network volume | 17.5s | 37.6s |
+| **volumecache**: hydrate + load from container disk | 5.5s + 1.3s = **7.2s** | 10.2s + 4.6s = **15.5s** |
+| **nocache**: HF download + load | 18.9s | 28.3s |
+| **modelstore**: load (storage time) | 2.7s | 14.1s |
+| modelstore platform delay (worker wait) | 69.9s (vs ~16s for the others) | 34.3s (9.5–115s) |
+| cold request end to end, fastest → slowest | volumecache 27.9 · volume 44.9 · nocache 45.7 · modelstore 77.7 | volumecache 49.6 · modelstore 58.1 · nocache 58.2 · volume 78.9 |
+
+- **Reading weights in place from the network volume is ~2.4× slower than VolumeCache**
+  (hydrate, then load locally) at both model sizes. Loading safetensors directly off the MooseFS
+  mount gets ≈ 340–390 MiB/s; hydrate copies at ≈ 1.0–1.4 GiB/s, and the load that follows reads from local disk.
+- **At the 7B size, `volume` was even slower than downloading from Hugging Face on every cold start.**
+- **Model Store loads fastest once the worker is running, but worker placement dominates**: its
+  platform delay was the largest and least predictable of the four strategies in both runs.
+- **VolumeCache still contacts the Hub on every cold start** (~0.5s, metadata only). It skips symlinks
+  and `refs/`, so the hydrated HF cache has to be re-linked through the Hub.
+- Warm throughput is the same for every strategy (≈ 44 tok/s for 7B): storage stops mattering once
+  the weights are in VRAM.
+
 ## What is compared
 
 Four queue-based GPU endpoints run **identical handler code** on the same GPU class in
