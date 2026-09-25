@@ -16,28 +16,32 @@ LABELS = {
     "modelstore": "Runpod Model Store (cached model)",
 }
 GIB = 1024 ** 3
+DELAY_OUTLIER_FACTOR = 2.0
 
 
 @dataclass(frozen=True)
 class Stat:
+    """Median-first: cold starts have scheduler outliers (a 118 s placement wait
+    next to 10 s ones) that drag a mean far from the typical case."""
     n: int
+    median: float | None
     mean: float | None
-    stdev: float | None
     lo: float | None
     hi: float | None
 
     def fmt(self, unit: str = "s", digits: int = 1) -> str:
-        if not self.n or self.mean is None:
+        if not self.n or self.median is None:
             return "—"
-        spread = f" ± {self.stdev:.{digits}f}" if self.stdev else ""
-        return f"{self.mean:.{digits}f}{spread}{unit}"
+        if self.n == 1 or self.lo == self.hi:
+            return f"{self.median:.{digits}f}{unit}"
+        return f"{self.median:.{digits}f}{unit} [{self.lo:.{digits}f}–{self.hi:.{digits}f}]"
 
 
 def stat(values) -> Stat:
     xs = [float(v) for v in values if v is not None]
     if not xs:
         return Stat(0, None, None, None, None)
-    return Stat(len(xs), statistics.fmean(xs), statistics.stdev(xs) if len(xs) > 1 else None, min(xs), max(xs))
+    return Stat(len(xs), statistics.median(xs), statistics.fmean(xs), min(xs), max(xs))
 
 
 def load_trials(path: str) -> list[dict]:
@@ -118,7 +122,7 @@ def environment(trials: list[dict]) -> dict:
 
 def ranking(summary: dict) -> list[str]:
     ranked = [s for s in summary if summary[s]["cold_e2e"].n]
-    return sorted(ranked, key=lambda s: summary[s]["cold_e2e"].mean)
+    return sorted(ranked, key=lambda s: summary[s]["cold_e2e"].median)
 
 
 def volume_vs_volumecache(summary: dict) -> str | None:
@@ -127,16 +131,18 @@ def volume_vs_volumecache(summary: dict) -> str | None:
     v, vc = summary.get("volume"), summary.get("volumecache")
     if not v or not vc or not v["storage"].n or not vc["storage"].n:
         return None
-    a, b = v["storage"].mean, vc["storage"].mean
+    a, b = v["storage"].median, vc["storage"].median
     faster, slower = ("volume", "volumecache") if a < b else ("volumecache", "volume")
     ratio = max(a, b) / min(a, b)
     e2e = ""
     if v["cold_e2e"].n and vc["cold_e2e"].n:
-        e2e = (f" End to end (client-observed cold request) that is {v['cold_e2e'].mean:.1f}s vs "
-               f"{vc['cold_e2e'].mean:.1f}s.")
-    return (f"**{faster}** gets the model onto the GPU faster: storage time (acquire + load) "
-            f"{a:.1f}s for volume vs {b:.1f}s for VolumeCache (hydrate {vc['hydrate'].fmt()}, "
-            f"then load {vc['load'].fmt()} from container disk) — {slower} is {ratio:.2f}× slower.{e2e}")
+        e2e = (f" Client-observed cold request: volume {v['cold_e2e'].median:.1f}s vs VolumeCache "
+               f"{vc['cold_e2e'].median:.1f}s (medians; this also includes scheduler placement, which the "
+               f"strategy does not control).")
+    return (f"**{faster}** gets the model onto the GPU faster. Median storage time (acquire + load): "
+            f"volume {a:.1f}s (loading straight off the mount: {v['load'].fmt()}) vs VolumeCache {b:.1f}s "
+            f"(hydrate {vc['hydrate'].fmt()} + load from container disk {vc['load'].fmt()}) — "
+            f"{slower} is {ratio:.2f}× slower.{e2e}")
 
 
 def render(meta: dict, trials: list[dict]) -> str:
@@ -148,7 +154,7 @@ def render(meta: dict, trials: list[dict]) -> str:
     lines += [f"- **Model:** `{meta['model']}`" + (f" ({size / GIB:.2f} GiB of weights/tokenizer)" if size else ""),
               f"- **GPU:** {env.get('gpu') or meta['gpu']} · **Datacenter:** {meta['datacenter']}",
               f"- **Trials:** {meta['cold_trials']} forced-cold per strategy, {meta['warm_per_cold']} warm after each; "
-              f"strategies run {'concurrently' if meta['parallel'] else 'one at a time'}; "
+              f"strategies run {'concurrently in waves' if meta['parallel'] else 'one at a time'}; "
               f"page cache evicted before storage reads: {'yes' if meta['evict_page_cache'] else 'no'}",
               f"- **Versions:** " + ", ".join(f"{k} {v}" for k, v in (env.get("versions") or {}).items() if v), ""]
 
@@ -158,8 +164,8 @@ def render(meta: dict, trials: list[dict]) -> str:
     if verdict:
         lines += [verdict, ""]
     if order:
-        lines += ["Cold-request ranking (client-observed, mean): " +
-                  " < ".join(f"{s} {summary[s]['cold_e2e'].mean:.1f}s" for s in order), ""]
+        lines += ["Cold-request ranking (client-observed, median): " +
+                  " < ".join(f"{s} {summary[s]['cold_e2e'].median:.1f}s" for s in order), ""]
 
     lines += ["## Cold start (forced scale-to-zero, first request on a new worker)", "",
               "| strategy | cold request e2e | platform delay | handler exec | import | acquire | ↳ hydrate | ↳ Hub | load (tok+model) | **storage total** | first generate | n |",
@@ -171,7 +177,8 @@ def render(meta: dict, trials: list[dict]) -> str:
                      f"{x['hub'].fmt(digits=2)} | {x['load'].fmt(digits=2)} | **{x['storage'].fmt(digits=2)}** | "
                      f"{x['first_generate'].fmt(digits=2)} | {x['cold_n']}"
                      + (f" (+{x['cold_invalid']} invalid)" if x["cold_invalid"] else "") + " |")
-    lines += ["", "- *cold request e2e*: job accepted → result as seen by the client (includes queueing, worker start, "
+    lines += ["", "Cells are **median [min–max]** over valid cold trials.", "",
+              "- *cold request e2e*: job accepted → result as seen by the client (includes queueing, worker start, "
               "container/Python boot, the handler, and 0.5s polling granularity; excludes the benchmark's own "
               "un-pause window).",
               "- *platform delay*: Runpod `delayTime` — queue wait + worker start before the handler runs. "
@@ -220,7 +227,24 @@ def _observations(summary: dict, strategies: list[str]) -> list[str]:
         if len(x["workers"]) < x["cold_n"]:
             obs.append(f"- `{s}`: {x['cold_n']} cold trials ran on {len(x['workers'])} distinct worker id(s) — "
                        "FlashBoot restarted the same worker; its process was still fresh (verified per trial).")
+    obs += _delay_outliers(summary, strategies)
     return obs or ["- Nothing unusual flagged automatically."]
+
+
+def _delay_outliers(summary: dict, strategies: list[str]) -> list[str]:
+    """Flag a strategy whose platform delay (scheduling + worker start) is far above the rest."""
+    delays = {s: summary[s]["cold_delay"].median for s in strategies if summary[s]["cold_delay"].n}
+    out = []
+    for s, d in delays.items():
+        others = [x for k, x in delays.items() if k != s]
+        if others and d > DELAY_OUTLIER_FACTOR * statistics.median(others):
+            out.append(f"- `{s}` waited {summary[s]['cold_delay'].fmt()} for a worker on cold starts vs a median of "
+                       f"{statistics.median(others):.1f}s for the other strategies. That platform delay, not "
+                       f"loading, dominates its cold start"
+                       + (" — consistent with the documented behaviour of holding workers until a host that has "
+                          "the cached model is available (the delay is not billed as worker time)."
+                          if s == "modelstore" else "."))
+    return out
 
 
 def _caveats(meta: dict) -> list[str]:
@@ -230,6 +254,8 @@ def _caveats(meta: dict) -> list[str]:
             "- `posix_fadvise(DONTNEED)` evicts the kernel page cache for files read off the volume/Model Store, "
             "but cannot reach a FUSE client's own userspace cache on the host — a same-host restart may still read warm.",
             "- nocache downloads straight from the Hugging Face CDN; its numbers move with CDN/WAN conditions.",
+            "- `GPU` names a class, not a machine: hosts in the same class differ (see the warm tokens/s range), "
+            "which shows up in import, load and generate times alike.",
             ("- Cold rounds ran strategies concurrently in waves; `volume` and `volumecache` were never in the "
              "same wave, so they did not contend for the network volume. (The prime phase runs all four at once.)"
              if meta["parallel"] else "- Strategies ran one at a time (PARALLEL=0)."),

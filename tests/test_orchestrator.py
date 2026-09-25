@@ -137,10 +137,25 @@ def test_summary_and_verdict_compare_storage_time():
               trial("volumecache", "cold", 99, valid=False), trial("volume", "warm", 1.5)]
     s = report.summarize(trials, ["volume", "volumecache"])
     assert s["volume"]["cold_n"] == 2 and s["volumecache"]["cold_invalid"] == 1
-    assert s["volume"]["storage"].mean == pytest.approx(6.1)
+    assert s["volume"]["storage"].median == pytest.approx(6.1)
     verdict = report.volume_vs_volumecache(s)
     assert verdict.startswith("**volumecache**") and "2.03×" in verdict
     assert report.ranking(s) == ["volumecache", "volume"]
+
+
+def test_stat_is_median_first_and_robust_to_outliers():
+    x = report.stat([10, 11, 118])
+    assert x.median == 11 and x.fmt() == "11.0s [10.0–118.0]"
+    assert report.stat([]).fmt() == "—" and report.stat([2]).fmt() == "2.0s"
+
+
+def test_platform_delay_outlier_is_flagged():
+    trials = [trial(s, "cold", 20) for s in ("nocache", "volume")]
+    slow = trial("modelstore", "cold", 80)
+    slow["delay_ms"] = 70000
+    s = report.summarize(trials + [slow], ["nocache", "volume", "modelstore"])
+    obs = report._delay_outliers(s, ["nocache", "volume", "modelstore"])
+    assert len(obs) == 1 and "modelstore" in obs[0]
 
 
 def test_render_includes_all_sections(tmp_path):
