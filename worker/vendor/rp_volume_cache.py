@@ -1,4 +1,5 @@
-# Vendored verbatim from runpod-python 1.12.0 (runpod/serverless/utils/rp_volume_cache.py, MIT).
+# Vendored verbatim from runpod-python 1.12.0 (runpod/serverless/utils/rp_volume_cache.py),
+# MIT-licensed, Copyright (c) 2025 Runpod -- see LICENSE.runpod-python in this directory.
 # Why: the Flash GPU base image ships an older runpod without VolumeCache, and the
 # harness imports runpod before our handler, so a newer pin cannot take effect.
 # worker/strategies.py prefers runpod.serverless.VolumeCache when present.
