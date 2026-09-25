@@ -8,6 +8,9 @@ only in *where the bytes come from*:
 - volume       HF cache lives on the network volume; load straight off the mount
 - volumecache  HF cache on container disk, mirrored to the volume by VolumeCache
 - modelstore   Runpod cached model, pre-staged by the platform
+- globalstore  Runpod Global Store (object-backed, geesefs) mounted at /runpod-volume;
+               load straight off the mount
+- gsvolumecache  HF cache on container disk, mirrored to Global Store by VolumeCache
 
 Every strategy resolves offline first and only calls the Hub when the files are
 not already usable -- that is the best-practice version of each strategy, and
@@ -29,12 +32,14 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-STRATEGIES = ("nocache", "volume", "volumecache", "modelstore")
+STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache")
 
 VOLUME_ROOT = "/runpod-volume"
 LOCAL_ROOT = "/opt/hfbench"                       # container disk, outside /root/.cache
 VOLUME_HF_CACHE = f"{VOLUME_ROOT}/hfbench/hub"    # `volume` strategy's HF cache
 MODELSTORE_HUB = f"{VOLUME_ROOT}/huggingface-cache/hub"
+GLOBALSTORE_MODELS = f"{VOLUME_ROOT}/hfbench/models"   # plain files, not an HF cache (see acquire_globalstore)
+COMPLETE_MARKER = ".hfbench-complete"
 DEFAULT_REVISION = "main"
 POPULATION_MIN_BYTES = 1 << 20
 
@@ -176,6 +181,7 @@ def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: st
     snap, _ = _resolve_or_download_linked(repo_id, hub_root, token, t)
     fetched = tree_bytes(hub_root) - hydrated_bytes
     synced = False
+    mirror_bytes = None
     # Relinking after hydrate writes only refs/ (~100 bytes, excluded from the
     # mirror anyway); real model bytes mean this was the first population, so
     # write the mirror before returning so the next cold start can use it.
@@ -184,10 +190,12 @@ def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: st
         vc.sync(background=False)
         t["sync_s"] = time.monotonic() - t1
         synced = True
+        mirror_bytes = tree_bytes(Path(volume_path) / ".cache" / namespace)
     return Acquired(path=str(snap), timings=t, bytes_total=tree_bytes(hub_root),
                     hub_online="hub_s" in t or "download_s" in t,
                     notes={"impl": impl, "files_hydrated": restored, "hydrated_bytes": hydrated_bytes,
-                           "hub_fetched_bytes": fetched, "synced": synced, "leftover_bytes": leftover})
+                           "hub_fetched_bytes": fetched, "synced": synced, "leftover_bytes": leftover,
+                           "mirror_bytes_after_sync": mirror_bytes})
 
 
 def _resolve_or_download_linked(repo_id: str, hub_root: str, token: str | None, t: dict) -> tuple[Path, bool]:
@@ -219,6 +227,89 @@ def acquire_modelstore(repo_id: str, token: str | None = None, *, hub_root: str 
     return Acquired(path=str(snap), timings={"resolve_s": time.monotonic() - t0},
                     bytes_total=sum(p.stat().st_size for p in files),
                     notes={"snapshot": str(snap)}, shared_storage_files=[str(p) for p in files])
+
+
+def acquire_globalstore(repo_id: str, token: str | None = None, *, models_root: str = GLOBALSTORE_MODELS,
+                        stage_root: str = LOCAL_ROOT) -> Acquired:
+    """Load straight off Global Store.
+
+    Global Store cannot hold an HF hub cache: snapshot symlinks written by one
+    worker come back as 0-byte regular files on the next worker's mount, so the
+    snapshot "resolves" and then fails to load. The store therefore holds a
+    plain directory of real files, populated once by staging a download on
+    container disk and copying with copyfile (chmod/utime are EPERM there). A
+    marker written last makes a half-copied directory count as absent.
+    """
+    target = Path(models_root) / repo_id.replace("/", "--")
+    t: dict[str, float] = {}
+    t0 = time.monotonic()
+    populated = False
+    if not (target / COMPLETE_MARKER).is_file():
+        t1 = time.monotonic()
+        stage = Path(stage_root) / "gs-stage"
+        shutil.rmtree(stage, ignore_errors=True)
+        snap = _download(repo_id, str(stage), token)
+        t["download_s"] = time.monotonic() - t1
+        t2 = time.monotonic()
+        copy_real_files(snap, target)
+        (target / COMPLETE_MARKER).write_text(repo_id)
+        t["upload_s"] = time.monotonic() - t2
+        shutil.rmtree(stage, ignore_errors=True)
+        populated = True
+    else:
+        t["resolve_s"] = time.monotonic() - t0
+    files = [p for p in target.iterdir() if p.is_file() and p.name != COMPLETE_MARKER]
+    return Acquired(path=str(target), timings=t, bytes_total=sum(p.stat().st_size for p in files),
+                    hub_online=populated, notes={"populated_now": populated},
+                    shared_storage_files=[str(p) for p in files])
+
+
+def copy_real_files(snapshot: Path, target: Path) -> int:
+    """Copy a snapshot's files (symlinks resolved) into a flat directory; data only."""
+    target.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for src in sorted(p for p in snapshot.rglob("*") if p.is_file()):
+        dst = target / src.relative_to(snapshot)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src.resolve(), dst)
+        copied += dst.stat().st_size
+    return copied
+
+
+def global_store_volumecache_class():
+    """VolumeCache that works on Global Store.
+
+    Stock VolumeCache mirrors big files with shutil.copy2, whose copystat
+    (chmod/utime) raises EPERM on Global Store; _copy_file swallows the error,
+    so every file >= 256 KiB is silently left out of the mirror and each cold
+    start re-downloads the weights. This subclass copies data with copyfile and
+    applies metadata only where the filesystem allows it. Mirror mtimes then
+    reflect upload time (newer than the source), which the size/mtime diff
+    tolerates: hydrate copies them because the local file is missing, and
+    copystat onto local disk makes the next comparison converge.
+    """
+    import threading
+
+    base, impl = load_volumecache_class()
+
+    class GlobalStoreVolumeCache(base):
+        def _copy_file(self, src, dst):
+            tmp = f"{dst}.{os.getpid()}.{threading.get_ident()}.rpvc.tmp"
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(src, tmp)
+                try:
+                    shutil.copystat(src, tmp)
+                except OSError:
+                    pass      # Global Store: no chmod/utime; data is what matters
+                os.replace(tmp, dst)
+                return True
+            except OSError:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                return False
+
+    return GlobalStoreVolumeCache, f"{impl}+globalstore-copyfile"
 
 
 def evict_page_cache(paths: list[str]) -> int:

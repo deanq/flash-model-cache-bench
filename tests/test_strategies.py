@@ -147,3 +147,49 @@ def test_evict_page_cache_counts_bytes_and_skips_missing(tmp_path):
     f = tmp_path / "a"
     f.write_bytes(b"z" * 10)
     assert st.evict_page_cache([str(f), str(tmp_path / "missing")]) == 10
+
+
+def test_globalstore_populates_plain_files_once_then_resolves(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_download(repo, cache_dir, token):
+        calls.append(cache_dir)
+        return make_hf_cache(Path(cache_dir), repo)
+
+    monkeypatch.setattr(st, "_download", fake_download)
+    models = tmp_path / "gs"
+    first = st.acquire_globalstore(REPO, models_root=str(models), stage_root=str(tmp_path / "local"))
+    target = Path(first.path)
+    assert first.notes["populated_now"] and "upload_s" in first.timings
+    assert (target / st.COMPLETE_MARKER).is_file()
+    assert not any(p.is_symlink() for p in target.iterdir())          # real files, no HF symlinks
+    assert (target / "model.safetensors").stat().st_size == 4096
+    second = st.acquire_globalstore(REPO, models_root=str(models), stage_root=str(tmp_path / "local"))
+    assert not second.hub_online and "resolve_s" in second.timings and len(calls) == 1
+    assert st.COMPLETE_MARKER not in [Path(p).name for p in second.shared_storage_files]
+
+
+def test_globalstore_without_marker_is_treated_as_absent(tmp_path, monkeypatch):
+    models = tmp_path / "gs"
+    partial = models / REPO.replace("/", "--")
+    partial.mkdir(parents=True)
+    (partial / "model.safetensors").write_bytes(b"half")               # copy interrupted before the marker
+    monkeypatch.setattr(st, "_download", lambda repo, cache_dir, token: make_hf_cache(Path(cache_dir), repo))
+    acq = st.acquire_globalstore(REPO, models_root=str(models), stage_root=str(tmp_path / "local"))
+    assert acq.notes["populated_now"] and (partial / "model.safetensors").stat().st_size == 4096
+
+
+def test_global_store_volumecache_copies_when_metadata_is_rejected(tmp_path, monkeypatch):
+    def eperm(*a, **k):
+        raise PermissionError(1, "Operation not permitted")
+
+    cls, impl = st.global_store_volumecache_class()
+    assert impl.endswith("+globalstore-copyfile")
+    src = tmp_path / "src"
+    src.write_bytes(b"w" * 1000)
+    monkeypatch.setattr(st.shutil, "copystat", eperm)                 # what Global Store does
+    vc = cls.__new__(cls)
+    assert vc._copy_file(str(src), str(tmp_path / "mirror" / "big")) is True
+    assert (tmp_path / "mirror" / "big").read_bytes() == b"w" * 1000
+    base, _ = st.load_volumecache_class()
+    assert base._copy_file(vc, str(src), str(tmp_path / "mirror" / "stock")) is False   # the stock bug

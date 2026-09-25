@@ -40,8 +40,17 @@ def _acquire(strategy: str, model_id: str, token: str | None, evict: bool) -> st
         acq = strategies.acquire_volumecache(model_id, token, namespace=namespace)
         acq.notes["evicted_mirror_bytes"] = evicted
         return acq
+    if strategy == "gsvolumecache":
+        namespace = os.environ["BENCH_NAMESPACE"]
+        evicted = strategies.evict_page_cache(strategies.volumecache_mirror_files(namespace)) if evict else 0
+        cls, impl = strategies.global_store_volumecache_class()
+        acq = strategies.acquire_volumecache(model_id, token, namespace=namespace, cache_cls=cls)
+        acq.notes.update(evicted_mirror_bytes=evicted, impl=impl)
+        return acq
     if strategy == "modelstore":
         return strategies.acquire_modelstore(model_id, token)
+    if strategy == "globalstore":
+        return strategies.acquire_globalstore(model_id, token)
     raise ValueError(f"unknown strategy {strategy!r}; expected one of {strategies.STRATEGIES}")
 
 

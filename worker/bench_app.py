@@ -52,7 +52,7 @@ def _config(strategy: str, volume) -> dict:
 
 
 # `flash build` reads dependencies=[...] from the source AST, so each decorator
-# repeats the literal list instead of sharing a constant. Keep the four in sync.
+# repeats the literal list instead of sharing a constant. Keep them in sync.
 @Endpoint(**_config("nocache", None), dependencies=["transformers>=4.56", "accelerate>=1.0", "safetensors"])
 async def hfbench_nocache(**payload) -> dict:
     return runtime.handle("nocache", payload)
@@ -73,3 +73,16 @@ async def hfbench_volumecache(**payload) -> dict:
 @Endpoint(**_config("modelstore", None), dependencies=["transformers>=4.56", "accelerate>=1.0", "safetensors"])
 async def hfbench_modelstore(**payload) -> dict:
     return runtime.handle("modelstore", payload)
+
+
+# Global Store endpoints: the global volume is attached after deploy
+# (bench/runpod_api.py) -- Flash has no parameter for it, and an endpoint cannot
+# combine it with a network volume, hence separate endpoints from volume/volumecache.
+@Endpoint(**_config("globalstore", None), dependencies=["transformers>=4.56", "accelerate>=1.0", "safetensors"])
+async def hfbench_globalstore(**payload) -> dict:
+    return runtime.handle("globalstore", payload)
+
+
+@Endpoint(**_config("gsvolumecache", None), dependencies=["transformers>=4.56", "accelerate>=1.0", "safetensors"])
+async def hfbench_gsvolumecache(**payload) -> dict:
+    return runtime.handle("gsvolumecache", payload)

@@ -3,6 +3,8 @@
 - invoking deployed endpoints and reading job timing (/run, /status, /health)
 - attaching a Model Store cached model (GraphQL `modelReferences`) -- Flash
   1.20 has no field for it, and the REST API does not expose it either
+- creating/attaching/deleting a Global Store volume (GraphQL
+  `globalStoreBucket*` and saveEndpoint `volumes`) -- same story
 - deleting the network volume and listing leftovers during teardown
 
 Lifecycle (deploy/undeploy) stays with the `flash` CLI.
@@ -93,14 +95,27 @@ class Runpod:
 
     def update_endpoint(self, endpoint_id: str, **changes) -> dict:
         """saveEndpoint is an upsert: send the full current config back with only
-        `changes` applied. modelReferences is carried over so a later update
-        (e.g. a workersMax toggle) does not detach the cached model."""
+        `changes` applied. modelReferences and attached global volumes are carried
+        over so a later update (e.g. a workersMax toggle) does not detach them."""
         ep = self.endpoint(endpoint_id)
         payload = {k: ep[k] for k in _SAVE_FIELDS if ep.get(k) is not None}
         if ep.get("modelReferences"):
             payload["modelReferences"] = ep["modelReferences"]
+        global_volumes = _global_volume_inputs(ep.get("volumes"))
+        if global_volumes:
+            payload["volumes"] = global_volumes
         payload.update(changes)
         return self.graphql(_SAVE_MUTATION, {"input": payload})["saveEndpoint"]
+
+    def attach_global_volume(self, endpoint_id: str, volume_id: str) -> dict:
+        """Attach a Global Store volume (mounts at /runpod-volume). Flash 1.20 and
+        REST v2 cannot; this is the console's saveEndpoint `volumes` input."""
+        self.update_endpoint(endpoint_id, volumes=[{"volumeId": volume_id, "volumeType": OBJECT_STORE_VOLUME}])
+        attached = [v["volumeId"] for v in self.endpoint(endpoint_id).get("volumes") or []
+                    if v.get("volumeType") == OBJECT_STORE_VOLUME]
+        if attached != [volume_id]:
+            raise RunpodError(f"global volume {volume_id} not attached to {endpoint_id}: {attached}")
+        return {"id": endpoint_id, "globalVolume": volume_id}
 
     def set_model_references(self, endpoint_id: str, refs: list[str]) -> dict:
         """Attach Model Store cached model(s)."""
@@ -116,6 +131,18 @@ class Runpod:
 
     def list_endpoints(self) -> list[dict]:
         return self.graphql("query { myself { endpoints { id name } } }")["myself"]["endpoints"]
+
+    # --------------------------------------------------------- global store
+    def create_global_store(self, name: str) -> str:
+        data = self.graphql(_GS_CREATE, {"input": {"name": name}})
+        return data["globalStoreBucketCreate"]["id"]
+
+    def list_global_stores(self) -> list[dict]:
+        return self.graphql("query { myself { globalStoreBuckets { id name } } }")["myself"]["globalStoreBuckets"]
+
+    def delete_global_store(self, bucket_id: str) -> None:
+        if not self.graphql(_GS_DELETE, {"input": {"id": bucket_id}})["globalStoreBucketDelete"]:
+            raise RunpodError(f"globalStoreBucketDelete returned false for {bucket_id}")
 
     # -------------------------------------------------------------- volumes
     def list_network_volumes(self) -> list[dict]:
@@ -136,11 +163,18 @@ def model_reference(repo_id: str, revision: str | None = None) -> str:
     return ref.lower()
 
 
+def _global_volume_inputs(volumes) -> list[dict]:
+    return [{"volumeId": v["volumeId"], "volumeType": OBJECT_STORE_VOLUME}
+            for v in volumes or [] if v.get("volumeType") == OBJECT_STORE_VOLUME]
+
+
 def _raise_for(r: httpx.Response, what: str) -> None:
     if r.is_success:
         return
     raise RunpodError(f"{what}: HTTP {r.status_code}: {r.text[:500]}")
 
+
+OBJECT_STORE_VOLUME = "OBJECT_STORE_VOLUME"   # Global Store volume type in EndpointInput.volumes
 
 _SAVE_FIELDS = ("id", "name", "templateId", "gpuIds", "gpuCount", "workersMin", "workersMax", "idleTimeout",
                 "locations", "networkVolumeId", "scalerType", "scalerValue", "flashBootType",
@@ -152,10 +186,21 @@ query {
     id name templateId gpuIds gpuCount workersMin workersMax idleTimeout locations
     networkVolumeId scalerType scalerValue flashBootType executionTimeoutMs type
     allowedCudaVersions minCudaVersion flashEnvironmentId modelReferences
+    volumes { volumeId volumeType mountPath }
   } }
 }"""
 
 _SAVE_MUTATION = """
 mutation saveEndpoint($input: EndpointInput!) {
   saveEndpoint(input: $input) { id name modelReferences workersMax idleTimeout }
+}"""
+
+_GS_CREATE = """
+mutation globalStoreBucketCreate($input: GlobalStoreBucketCreateInput!) {
+  globalStoreBucketCreate(input: $input) { id name }
+}"""
+
+_GS_DELETE = """
+mutation globalStoreBucketDelete($input: GlobalStoreBucketDeleteInput!) {
+  globalStoreBucketDelete(input: $input)
 }"""

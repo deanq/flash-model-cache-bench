@@ -24,13 +24,23 @@ DRAIN_TIMEOUT_S = 180
 TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
 
 
+# Strategies that read the same shared storage; members of a group are never
+# measured at the same time so they don't compete for its bandwidth.
+SHARED_STORAGE = (("volume", "volumecache"), ("globalstore", "gsvolumecache"))
+
+
 def waves(strategies: list[str]) -> list[list[str]]:
-    """Group strategies for concurrent execution so no two volume-backed ones overlap."""
-    first = [s for s in strategies if s != "volumecache"]
-    rest = [s for s in strategies if s == "volumecache"]
-    if "volume" not in first:
-        return [strategies]
-    return [w for w in (first, rest) if w]
+    """Group strategies for concurrent execution: the i-th member of every
+    shared-storage group goes into wave i; unshared strategies join wave 0."""
+    out: list[list[str]] = [[]]
+    for s in strategies:
+        group = next((g for g in SHARED_STORAGE if s in g), None)
+        present = [x for x in group if x in strategies] if group else [s]
+        idx = present.index(s)
+        while len(out) <= idx:
+            out.append([])
+        out[idx].append(s)
+    return [w for w in out if w]
 
 
 @dataclass

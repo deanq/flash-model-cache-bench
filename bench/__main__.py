@@ -47,6 +47,9 @@ def cmd_run(args) -> int:
         state = deploy.deploy(cfg, rp)
         meta["endpoints"] = state.endpoints
         meta["model_reference"] = deploy.attach_cached_model(cfg, state, rp) if "modelstore" in cfg.strategies else None
+        if cfg.uses_global_store:
+            deploy.attach_global_store(cfg, state, rp)
+            meta["global_store_id"] = state.global_store_id
         _write_json(os.path.join(cfg.run_dir, "meta.json"), meta)
         driver = Driver(cfg, rp, state.endpoints, Recorder(os.path.join(cfg.run_dir, "results.jsonl")))
         primed = driver.prime()
@@ -77,13 +80,14 @@ def _finish(cfg, rp: Runpod, state, exit_code: int) -> int:
         deploy.log("KEEP=1: leaving resources up. Run `make clean` when done — they bill while workers run "
                    "and the volume bills per GB-month.")
         return exit_code
-    state = state or _load_state(cfg.run_id) or deploy.State(cfg.run_id, config_mod.APP_NAME, cfg.env_name,
-                                                              cfg.volume_name)
+    state = state or _load_state(cfg.run_id) or deploy.State(
+        cfg.run_id, config_mod.APP_NAME, cfg.env_name, cfg.volume_name,
+        global_store_name=cfg.global_store_name if cfg.uses_global_store else "")
     leftovers = deploy.teardown(state, rp)
     if leftovers:
         deploy.log(f"TEARDOWN INCOMPLETE — still present: {leftovers}. Re-run `make clean`.")
         return exit_code or 2
-    deploy.log("teardown verified: no endpoints or volume left")
+    deploy.log("teardown verified: no endpoints, network volume or global store left")
     return exit_code
 
 

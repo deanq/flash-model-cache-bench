@@ -138,8 +138,9 @@ def test_summary_and_verdict_compare_storage_time():
     s = report.summarize(trials, ["volume", "volumecache"])
     assert s["volume"]["cold_n"] == 2 and s["volumecache"]["cold_invalid"] == 1
     assert s["volume"]["storage"].median == pytest.approx(6.1)
-    verdict = report.volume_vs_volumecache(s)
-    assert verdict.startswith("**volumecache**") and "2.03×" in verdict
+    verdict = report.in_place_vs_cached(s, "volume", "volumecache", "network volume")
+    assert verdict.startswith("**network volume: volumecache**") and "2.03×" in verdict
+    assert report.verdicts(s) == [verdict]
     assert report.ranking(s) == ["volumecache", "volume"]
 
 
@@ -171,13 +172,51 @@ def test_render_includes_all_sections(tmp_path):
     assert "| modelstore | failed |" in md
 
 
-def test_waves_keep_volume_backed_strategies_apart():
+def test_waves_keep_shared_storage_strategies_apart():
     assert driver.waves(["nocache", "volume", "volumecache", "modelstore"]) == [
         ["nocache", "volume", "modelstore"], ["volumecache"]]
+    assert driver.waves(list(config.STRATEGIES)) == [
+        ["nocache", "volume", "modelstore", "globalstore"], ["volumecache", "gsvolumecache"]]
     assert driver.waves(["volumecache", "modelstore"]) == [["volumecache", "modelstore"]]
-    assert driver.waves(["volume"]) == [["volume"]]
+    assert driver.waves(["gsvolumecache"]) == [["gsvolumecache"]]
 
 
 def test_hub_column_is_empty_when_hub_never_used():
     s = report.summarize([trial("volume", "cold", 20, acquire=0.1)], ["volume"])
     assert s["volume"]["hub"].n == 0
+
+
+def test_update_endpoint_carries_global_volume_and_model_refs():
+    from bench.runpod_api import Runpod, OBJECT_STORE_VOLUME
+    rp = Runpod.__new__(Runpod)
+    sent = {}
+    ep = {"id": "e", "name": "n", "workersMax": 1, "modelReferences": ["m"],
+          "volumes": [{"volumeId": "g", "volumeType": OBJECT_STORE_VOLUME, "mountPath": "/runpod-volume"},
+                      {"volumeId": "nv", "volumeType": "NETWORK_VOLUME", "mountPath": "/runpod-volume"}]}
+    rp.endpoint = lambda eid: ep
+    rp.graphql = lambda q, v: sent.update(v["input"]) or {"saveEndpoint": {"id": "e"}}
+    rp.update_endpoint("e", workersMax=0)
+    assert sent["workersMax"] == 0 and sent["modelReferences"] == ["m"]
+    assert sent["volumes"] == [{"volumeId": "g", "volumeType": OBJECT_STORE_VOLUME}]
+
+
+def test_verify_clean_reports_leftover_global_store():
+    state = deploy.State("r", "app", "env", "hfbench-r", global_store_name="hfbench-r", global_store_id="g1")
+    rp = FakeRp()
+    rp.list_global_stores = lambda: [{"id": "g1", "name": "hfbench-r"}, {"id": "g2", "name": "someone-else"}]
+    assert deploy.verify_clean(state, rp) == ["global store hfbench-r (g1)"]
+
+
+def test_old_state_files_without_global_store_fields_still_load(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "runs" / "old").mkdir(parents=True)
+    (tmp_path / "runs" / "old" / "state.json").write_text(json.dumps(
+        {"run_id": "old", "app": "a", "env": "e", "volume_name": "v", "endpoints": {}, "volume_id": None,
+         "torn_down": True}))
+    assert deploy.State.load("old").global_store_id is None
+
+
+def test_config_knows_global_store_strategies():
+    assert config.load({"STRATEGIES": "nocache"}, run_id="r").uses_global_store is False
+    cfg = config.load({"STRATEGIES": "globalstore"}, run_id="r")
+    assert cfg.uses_global_store and cfg.global_store_name == "hfbench-r"

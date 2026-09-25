@@ -14,7 +14,14 @@ LABELS = {
     "volume": "network volume, loaded in place",
     "volumecache": "VolumeCache (volume -> container disk)",
     "modelstore": "Runpod Model Store (cached model)",
+    "globalstore": "Runpod Global Store (global volume), loaded in place",
+    "gsvolumecache": "VolumeCache (Global Store -> container disk)",
 }
+# (in place, VolumeCache, storage name): the question "is loading straight off
+# shared storage slower than copying it to container disk first?" per backend.
+IN_PLACE_VS_CACHED = (("volume", "volumecache", "network volume"),
+                      ("globalstore", "gsvolumecache", "Global Store"))
+VOLUMECACHE_STRATEGIES = ("volumecache", "gsvolumecache")
 GIB = 1024 ** 3
 DELAY_OUTLIER_FACTOR = 2.0
 
@@ -125,24 +132,27 @@ def ranking(summary: dict) -> list[str]:
     return sorted(ranked, key=lambda s: summary[s]["cold_e2e"].median)
 
 
-def volume_vs_volumecache(summary: dict) -> str | None:
-    """The headline question: is loading in place off the volume slower than
-    copying to container disk first?"""
-    v, vc = summary.get("volume"), summary.get("volumecache")
+def in_place_vs_cached(summary: dict, in_place: str, cached: str, storage: str) -> str | None:
+    """Is loading straight off `storage` slower than VolumeCache-copying it to container disk first?"""
+    v, vc = summary.get(in_place), summary.get(cached)
     if not v or not vc or not v["storage"].n or not vc["storage"].n:
         return None
     a, b = v["storage"].median, vc["storage"].median
-    faster, slower = ("volume", "volumecache") if a < b else ("volumecache", "volume")
+    faster, slower = (in_place, cached) if a < b else (cached, in_place)
     ratio = max(a, b) / min(a, b)
     e2e = ""
     if v["cold_e2e"].n and vc["cold_e2e"].n:
-        e2e = (f" Client-observed cold request: volume {v['cold_e2e'].median:.1f}s vs VolumeCache "
-               f"{vc['cold_e2e'].median:.1f}s (medians; this also includes scheduler placement, which the "
-               f"strategy does not control).")
-    return (f"**{faster}** gets the model onto the GPU faster. Median storage time (acquire + load): "
-            f"volume {a:.1f}s (loading straight off the mount: {v['load'].fmt()}) vs VolumeCache {b:.1f}s "
+        e2e = (f" Client-observed cold request: {in_place} {v['cold_e2e'].median:.1f}s vs {cached} "
+               f"{vc['cold_e2e'].median:.1f}s (medians; includes scheduler placement, which the strategy does "
+               f"not control).")
+    return (f"**{storage}: {faster}** gets the model onto the GPU faster. Median storage time (acquire + load): "
+            f"`{in_place}` {a:.1f}s (loading straight off the mount: {v['load'].fmt()}) vs `{cached}` {b:.1f}s "
             f"(hydrate {vc['hydrate'].fmt()} + load from container disk {vc['load'].fmt()}) — "
             f"{slower} is {ratio:.2f}× slower.{e2e}")
+
+
+def verdicts(summary: dict) -> list[str]:
+    return [v for v in (in_place_vs_cached(summary, *pair) for pair in IN_PLACE_VS_CACHED) if v]
 
 
 def render(meta: dict, trials: list[dict]) -> str:
@@ -158,10 +168,9 @@ def render(meta: dict, trials: list[dict]) -> str:
               f"page cache evicted before storage reads: {'yes' if meta['evict_page_cache'] else 'no'}",
               f"- **Versions:** " + ", ".join(f"{k} {v}" for k, v in (env.get("versions") or {}).items() if v), ""]
 
-    verdict = volume_vs_volumecache(summary)
     order = ranking(summary)
     lines += ["## Answer", ""]
-    if verdict:
+    for verdict in verdicts(summary):
         lines += [verdict, ""]
     if order:
         lines += ["Cold-request ranking (client-observed, median): " +
@@ -216,12 +225,12 @@ def _observations(summary: dict, strategies: list[str]) -> list[str]:
     obs = []
     for s in strategies:
         x = summary[s]
-        if x["cold_n"] and s in ("volumecache", "volume") and x["hub_online_cold"]:
+        if x["cold_n"] and s in ("volume", "globalstore", *VOLUMECACHE_STRATEGIES) and x["hub_online_cold"]:
             obs.append(f"- `{s}` needed the Hugging Face Hub on {x['hub_online_cold']}/{x['cold_n']} cold starts "
                        f"({x['hub'].fmt(digits=2)} each)."
                        + (" VolumeCache skips symlinks and `refs/`, so a hydrated HF cache has blobs but no "
                           "snapshot; `huggingface_hub` re-links it via Hub metadata calls (no weight bytes). "
-                          "A Hub outage would therefore fall back to a full download." if s == "volumecache" else ""))
+                          "A Hub outage would therefore fall back to a full download." if s in VOLUMECACHE_STRATEGIES else ""))
         if x["cold_invalid"]:
             obs.append(f"- `{s}`: {x['cold_invalid']} cold trial(s) invalid: {sorted(set(x['errors']))[:3]}")
         if len(x["workers"]) < x["cold_n"]:
@@ -250,17 +259,32 @@ def _delay_outliers(summary: dict, strategies: list[str]) -> list[str]:
 def _caveats(meta: dict) -> list[str]:
     return ["## Caveats", "",
             "- Each cold trial lands wherever the scheduler puts it; host disk, NIC and volume-cluster load vary. "
-            "Look at ± spread before reading small differences.",
+            "Look at the [min–max] range before reading small differences.",
             "- `posix_fadvise(DONTNEED)` evicts the kernel page cache for files read off the volume/Model Store, "
             "but cannot reach a FUSE client's own userspace cache on the host — a same-host restart may still read warm.",
             "- nocache downloads straight from the Hugging Face CDN; its numbers move with CDN/WAN conditions.",
             "- `GPU` names a class, not a machine: hosts in the same class differ (see the warm tokens/s range), "
             "which shows up in import, load and generate times alike.",
-            ("- Cold rounds ran strategies concurrently in waves; `volume` and `volumecache` were never in the "
-             "same wave, so they did not contend for the network volume. (The prime phase runs all four at once.)"
+            ("- Cold rounds ran strategies concurrently in waves; strategies sharing storage (`volume`/`volumecache`, "
+             "`globalstore`/`gsvolumecache`) were never in the same wave. (The prime phase runs all at once.)"
              if meta["parallel"] else "- Strategies ran one at a time (PARALLEL=0)."),
             "- Model Store is attached with the console's GraphQL `modelReferences` field; Flash 1.20 has no "
-            "parameter for it.", ""]
+            "parameter for it.",
+            *(_GLOBAL_STORE_CAVEATS if any(s in meta["strategies"] for s in ("globalstore", "gsvolumecache")) else []),
+            ""]
+
+
+_GLOBAL_STORE_CAVEATS = [
+    "- Global Store (beta) is attached with the console's saveEndpoint `volumes` input "
+    "(`OBJECT_STORE_VOLUME`); Flash 1.20 has no parameter for it. Its endpoints are pinned to the same "
+    "datacenter as the rest for comparability, although a global volume would let them run anywhere.",
+    "- Global Store is object storage behind a FUSE client (geesefs), which keeps its own memory cache that "
+    "`posix_fadvise` cannot evict.",
+    "- `globalstore` keeps a plain directory of real files, not an HF cache: HF snapshot symlinks written by one "
+    "worker come back as 0-byte regular files on the next worker's mount.",
+    "- `gsvolumecache` uses VolumeCache with a copyfile patch: stock VolumeCache's copy2 fails (EPERM on "
+    "chmod/utime) and silently leaves every large file out of the mirror.",
+]
 
 
 def write(run_dir: str) -> str:
