@@ -93,7 +93,7 @@ Set in `.env` or on the command line (`make run MODEL=... COLD_TRIALS=5`). See `
 ## Cost
 
 Every endpoint is `workers=(0, 1)`: at most four GPU workers exist at once, and only while a
-trial runs. A default run (3B model, 3 cold × 2 warm) takes roughly 20–30 minutes of wall time
+trial runs. A default run (3B model, 3 cold × 2 warm) takes roughly 15–20 minutes of wall time (measured: 16.5 min for 3B × 5 cold trials)
 and a few GPU-minutes per strategy. The network volume is deleted at the end.
 
 ## Measurement choices (and why)
