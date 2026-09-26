@@ -193,3 +193,10 @@ def test_global_store_volumecache_copies_when_metadata_is_rejected(tmp_path, mon
     assert (tmp_path / "mirror" / "big").read_bytes() == b"w" * 1000
     base, _ = st.load_volumecache_class()
     assert base._copy_file(vc, str(src), str(tmp_path / "mirror" / "stock")) is False   # the stock bug
+
+
+def test_global_store_volumecache_records_copy_failures(tmp_path):
+    cls, _ = st.global_store_volumecache_class()
+    vc = cls.__new__(cls)
+    assert vc._copy_file(str(tmp_path / "missing"), str(tmp_path / "out")) is False
+    assert len(vc.copy_errors) == 1 and "FileNotFoundError" in vc.copy_errors[0]

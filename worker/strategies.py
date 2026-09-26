@@ -195,7 +195,8 @@ def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: st
                     hub_online="hub_s" in t or "download_s" in t,
                     notes={"impl": impl, "files_hydrated": restored, "hydrated_bytes": hydrated_bytes,
                            "hub_fetched_bytes": fetched, "synced": synced, "leftover_bytes": leftover,
-                           "mirror_bytes_after_sync": mirror_bytes})
+                           "mirror_bytes_after_sync": mirror_bytes,
+                           "copy_errors": getattr(vc, "copy_errors", [])[:5]})
 
 
 def _resolve_or_download_linked(repo_id: str, hub_root: str, token: str | None, t: dict) -> tuple[Path, bool]:
@@ -293,6 +294,10 @@ def global_store_volumecache_class():
     base, impl = load_volumecache_class()
 
     class GlobalStoreVolumeCache(base):
+        # Stock VolumeCache logs copy failures at debug level and moves on; keep
+        # them so the benchmark can report what was skipped and why.
+        copy_errors: list[str]
+
         def _copy_file(self, src, dst):
             tmp = f"{dst}.{os.getpid()}.{threading.get_ident()}.rpvc.tmp"
             try:
@@ -304,7 +309,8 @@ def global_store_volumecache_class():
                     pass      # Global Store: no chmod/utime; data is what matters
                 os.replace(tmp, dst)
                 return True
-            except OSError:
+            except OSError as exc:
+                self.__dict__.setdefault("copy_errors", []).append(f"{src}: {type(exc).__name__}: {exc}")
                 if os.path.exists(tmp):
                     os.remove(tmp)
                 return False

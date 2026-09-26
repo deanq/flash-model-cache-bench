@@ -1,0 +1,35 @@
+{
+  "run_id": "qwen3b-gs",
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "gpu": "ADA_24",
+  "datacenter": "EU-RO-1",
+  "volume_gb": 50,
+  "strategies": [
+    "nocache",
+    "volume",
+    "volumecache",
+    "modelstore",
+    "globalstore",
+    "gsvolumecache"
+  ],
+  "cold_trials": 5,
+  "warm_per_cold": 2,
+  "max_new_tokens": 128,
+  "parallel": true,
+  "evict_page_cache": true,
+  "prime_timeout_s": 2700,
+  "trial_timeout_s": 1200,
+  "keep": false,
+  "started_at": 1790377853.25665,
+  "endpoints": {
+    "globalstore": "342rsesoyum7nf",
+    "gsvolumecache": "fvqaidbzzv5whv",
+    "modelstore": "33gsdqruhcnykz",
+    "nocache": "sjudb9e1qdb3jn",
+    "volume": "7txmnxtzk35oeh",
+    "volumecache": "22ffc5w3akbfl8"
+  },
+  "model_reference": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct:aa8e72537993ba99e69dfaafa59ed015b17504d1",
+  "global_store_id": "cmuhkqx86000007l2b34u1wkd",
+  "finished_at": 1790383373.785985
+}
