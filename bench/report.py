@@ -16,11 +16,13 @@ LABELS = {
     "modelstore": "Runpod Model Store (cached model)",
     "globalstore": "Runpod Global Store (global volume), loaded in place",
     "gsvolumecache": "VolumeCache (Global Store -> container disk)",
+    "gshydrate": "parallel range hydrate (Global Store -> container disk)",
 }
 # (in place, VolumeCache, storage name): the question "is loading straight off
 # shared storage slower than copying it to container disk first?" per backend.
 IN_PLACE_VS_CACHED = (("volume", "volumecache", "network volume"),
-                      ("globalstore", "gsvolumecache", "Global Store"))
+                      ("globalstore", "gsvolumecache", "Global Store"),
+                      ("globalstore", "gshydrate", "Global Store (parallel hydrate)"))
 VOLUMECACHE_STRATEGIES = ("volumecache", "gsvolumecache")
 GIB = 1024 ** 3
 DELAY_OUTLIER_FACTOR = 2.0
@@ -270,7 +272,7 @@ def _caveats(meta: dict) -> list[str]:
              if meta["parallel"] else "- Strategies ran one at a time (PARALLEL=0)."),
             "- Model Store is attached with the console's GraphQL `modelReferences` field; Flash 1.20 has no "
             "parameter for it.",
-            *(_GLOBAL_STORE_CAVEATS if any(s in meta["strategies"] for s in ("globalstore", "gsvolumecache")) else []),
+            *(_GLOBAL_STORE_CAVEATS if any(s in meta["strategies"] for s in ("globalstore", "gsvolumecache", "gshydrate")) else []),
             ""]
 
 

@@ -86,3 +86,8 @@ async def hfbench_globalstore(**payload) -> dict:
 @Endpoint(**_config("gsvolumecache", None), dependencies=["transformers>=4.56", "accelerate>=1.0", "safetensors"])
 async def hfbench_gsvolumecache(**payload) -> dict:
     return runtime.handle("gsvolumecache", payload)
+
+
+@Endpoint(**_config("gshydrate", None), dependencies=["transformers>=4.56", "accelerate>=1.0", "safetensors"])
+async def hfbench_gshydrate(**payload) -> dict:
+    return runtime.handle("gshydrate", payload)

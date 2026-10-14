@@ -11,6 +11,8 @@ only in *where the bytes come from*:
 - globalstore  Runpod Global Store (object-backed, geesefs) mounted at /runpod-volume;
                load straight off the mount
 - gsvolumecache  HF cache on container disk, mirrored to Global Store by VolumeCache
+- gshydrate    plain model folder on Global Store, copied to container disk with many
+               concurrent range reads, then loaded locally
 
 Every strategy resolves offline first and only calls the Hub when the files are
 not already usable -- that is the best-practice version of each strategy, and
@@ -32,7 +34,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache")
+STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate")
 
 VOLUME_ROOT = "/runpod-volume"
 LOCAL_ROOT = "/opt/hfbench"                       # container disk, outside /root/.cache
@@ -42,6 +44,18 @@ GLOBALSTORE_MODELS = f"{VOLUME_ROOT}/hfbench/models"   # plain files, not an HF 
 COMPLETE_MARKER = ".hfbench-complete"
 DEFAULT_REVISION = "main"
 POPULATION_MIN_BYTES = 1 << 20
+
+# gshydrate tuning, measured on pods (gv-hf-bench): geesefs serves each read as an
+# object GET with ~0.5-2s latency, so throughput comes from concurrency, not from
+# sequential readahead (~140 MiB/s per mount regardless of how many files are read
+# at once). What matters is bytes in flight (workers x chunk): 64 x 8 MiB reached
+# ~1.1 GiB/s (the host NIC) on quiet hosts, while 96 x 16 MiB overflowed geesefs'
+# buffer pool on a busy 8-GPU host (ENOMEM storm, throughput fell to ~100 MiB/s).
+HYDRATE_WORKERS = 64
+HYDRATE_CHUNK_BYTES = 8 << 20
+HYDRATE_RETRY_ERRNOS = frozenset({5, 11, 12})   # EIO, EAGAIN, ENOMEM: geesefs buffer pool exhausted
+HYDRATE_MAX_ATTEMPTS = 8
+HYDRATE_RETRY_BASE_S = 0.05
 
 
 @dataclass
@@ -241,28 +255,112 @@ def acquire_globalstore(repo_id: str, token: str | None = None, *, models_root: 
     container disk and copying with copyfile (chmod/utime are EPERM there). A
     marker written last makes a half-copied directory count as absent.
     """
-    target = Path(models_root) / repo_id.replace("/", "--")
     t: dict[str, float] = {}
-    t0 = time.monotonic()
-    populated = False
-    if not (target / COMPLETE_MARKER).is_file():
-        t1 = time.monotonic()
-        stage = Path(stage_root) / "gs-stage"
-        shutil.rmtree(stage, ignore_errors=True)
-        snap = _download(repo_id, str(stage), token)
-        t["download_s"] = time.monotonic() - t1
-        t2 = time.monotonic()
-        copy_real_files(snap, target)
-        (target / COMPLETE_MARKER).write_text(repo_id)
-        t["upload_s"] = time.monotonic() - t2
-        shutil.rmtree(stage, ignore_errors=True)
-        populated = True
-    else:
-        t["resolve_s"] = time.monotonic() - t0
-    files = [p for p in target.iterdir() if p.is_file() and p.name != COMPLETE_MARKER]
+    target, populated = _ensure_globalstore_copy(repo_id, token, models_root, stage_root, t)
+    files = _globalstore_files(target)
     return Acquired(path=str(target), timings=t, bytes_total=sum(p.stat().st_size for p in files),
                     hub_online=populated, notes={"populated_now": populated},
                     shared_storage_files=[str(p) for p in files])
+
+
+def _ensure_globalstore_copy(repo_id: str, token: str | None, models_root: str, stage_root: str,
+                             t: dict) -> tuple[Path, bool]:
+    """The model as a plain folder on Global Store; populated from the Hub on first use."""
+    target = Path(models_root) / repo_id.replace("/", "--")
+    t0 = time.monotonic()
+    if (target / COMPLETE_MARKER).is_file():
+        t["resolve_s"] = time.monotonic() - t0
+        return target, False
+    stage = Path(stage_root) / "gs-stage"
+    shutil.rmtree(stage, ignore_errors=True)
+    snap = _download(repo_id, str(stage), token)
+    t["download_s"] = time.monotonic() - t0
+    t1 = time.monotonic()
+    copy_real_files(snap, target)
+    (target / COMPLETE_MARKER).write_text(repo_id)
+    t["upload_s"] = time.monotonic() - t1
+    shutil.rmtree(stage, ignore_errors=True)
+    return target, True
+
+
+def _globalstore_files(target: Path) -> list[Path]:
+    return sorted(p for p in target.rglob("*") if p.is_file() and p.name != COMPLETE_MARKER)
+
+
+def acquire_gshydrate(repo_id: str, token: str | None = None, *, models_root: str = GLOBALSTORE_MODELS,
+                      local_root: str = LOCAL_ROOT, workers: int = HYDRATE_WORKERS,
+                      chunk_bytes: int = HYDRATE_CHUNK_BYTES) -> Acquired:
+    """Copy the Global Store folder to container disk with concurrent range reads, load locally."""
+    t: dict[str, float] = {}
+    target, populated = _ensure_globalstore_copy(repo_id, token, models_root, local_root, t)
+    local = Path(local_root) / "gshydrate" / target.name
+    leftover = tree_bytes(local)
+    shutil.rmtree(local, ignore_errors=True)       # FlashBoot restarts can keep container disk
+    t0 = time.monotonic()
+    stats = parallel_hydrate(target, local, workers=workers, chunk_bytes=chunk_bytes)
+    t["hydrate_s"] = time.monotonic() - t0
+    return Acquired(path=str(local), timings=t, bytes_total=stats["bytes"], hub_online=populated,
+                    notes={"populated_now": populated, "leftover_bytes": leftover, "hydrate": stats},
+                    shared_storage_files=[str(p) for p in _globalstore_files(target)])
+
+
+def parallel_hydrate(src: Path, dst: Path, *, workers: int, chunk_bytes: int) -> dict:
+    """Copy a directory tree with `workers` concurrent pread/pwrite range copies.
+
+    Each range opens its own descriptor, so geesefs serves ranges as independent
+    concurrent GETs instead of one sequential readahead stream. Transient FUSE
+    errors (ENOMEM etc. under load) are retried with backoff; anything else raises
+    with the file and offset. Returns {"files", "bytes", "ranges", "retries"}.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    src, dst = Path(src), Path(dst)
+    files = _globalstore_files(src)
+    work: list[tuple[Path, Path, int, int]] = []
+    for f in files:
+        out = dst / f.relative_to(src)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        size = f.stat().st_size
+        with open(out, "wb") as fh:
+            fh.truncate(size)
+        work.extend((f, out, off, min(chunk_bytes, size - off)) for off in range(0, size, chunk_bytes))
+    work.sort(key=lambda w: (w[2], str(w[0])))      # spread concurrent readers across all files
+    retries = [0]
+
+    def run(item: tuple[Path, Path, int, int]) -> int:
+        for attempt in range(HYDRATE_MAX_ATTEMPTS):
+            try:
+                return _copy_range(*item)
+            except OSError as exc:
+                if exc.errno not in HYDRATE_RETRY_ERRNOS or attempt == HYDRATE_MAX_ATTEMPTS - 1:
+                    raise OSError(exc.errno, f"hydrate {item[0]} @ {item[2]}: {exc.strerror}") from exc
+                retries[0] += 1
+                time.sleep(HYDRATE_RETRY_BASE_S * (2 ** attempt))
+        raise AssertionError("unreachable")
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        copied = sum(ex.map(run, work))
+    return {"files": len(files), "bytes": copied, "ranges": len(work), "retries": retries[0],
+            "workers": workers, "chunk_bytes": chunk_bytes}
+
+
+def _copy_range(src: Path, dst: Path, off: int, length: int) -> int:
+    sfd = os.open(src, os.O_RDONLY)
+    try:
+        dfd = os.open(dst, os.O_WRONLY)
+        try:
+            done = 0
+            while done < length:
+                buf = os.pread(sfd, length - done, off + done)
+                if not buf:
+                    raise OSError(5, f"short read: got {done} of {length} bytes")
+                os.pwrite(dfd, buf, off + done)
+                done += len(buf)
+            return done
+        finally:
+            os.close(dfd)
+    finally:
+        os.close(sfd)
 
 
 def copy_real_files(snapshot: Path, target: Path) -> int:

@@ -176,9 +176,10 @@ def test_waves_keep_shared_storage_strategies_apart():
     assert driver.waves(["nocache", "volume", "volumecache", "modelstore"]) == [
         ["nocache", "volume", "modelstore"], ["volumecache"]]
     assert driver.waves(list(config.STRATEGIES)) == [
-        ["nocache", "volume", "modelstore", "globalstore"], ["volumecache", "gsvolumecache"]]
+        ["nocache", "volume", "modelstore", "globalstore"], ["volumecache", "gsvolumecache"], ["gshydrate"]]
     assert driver.waves(["volumecache", "modelstore"]) == [["volumecache", "modelstore"]]
     assert driver.waves(["gsvolumecache"]) == [["gsvolumecache"]]
+    assert driver.waves(["nocache", "globalstore", "gshydrate"]) == [["nocache", "globalstore"], ["gshydrate"]]
 
 
 def test_hub_column_is_empty_when_hub_never_used():

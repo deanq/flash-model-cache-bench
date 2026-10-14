@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
+from pathlib import Path
 
 import strategies
 
@@ -51,6 +52,15 @@ def _acquire(strategy: str, model_id: str, token: str | None, evict: bool) -> st
         return strategies.acquire_modelstore(model_id, token)
     if strategy == "globalstore":
         return strategies.acquire_globalstore(model_id, token)
+    if strategy == "gshydrate":
+        # gshydrate reads the store during acquire, so evict before, not after.
+        folder = Path(strategies.GLOBALSTORE_MODELS) / model_id.replace("/", "--")
+        files = [str(p) for p in folder.rglob("*") if p.is_file()] if folder.is_dir() else []
+        evicted = strategies.evict_page_cache(files) if evict else 0
+        acq = strategies.acquire_gshydrate(model_id, token)
+        acq.notes["evicted_store_bytes"] = evicted
+        acq.shared_storage_files = []        # loads from container disk
+        return acq
     raise ValueError(f"unknown strategy {strategy!r}; expected one of {strategies.STRATEGIES}")
 
 

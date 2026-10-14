@@ -200,3 +200,81 @@ def test_global_store_volumecache_records_copy_failures(tmp_path):
     vc = cls.__new__(cls)
     assert vc._copy_file(str(tmp_path / "missing"), str(tmp_path / "out")) is False
     assert len(vc.copy_errors) == 1 and "FileNotFoundError" in vc.copy_errors[0]
+
+
+# ------------------------------------------------------------- gshydrate
+def _tree(root: Path, files: dict[str, bytes]) -> None:
+    for rel, data in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+
+def test_parallel_hydrate_copies_tree_byte_identically_across_chunk_boundaries(tmp_path):
+    files = {"model-1.safetensors": os.urandom(10_000), "sub/tok.json": b"{}", "empty.txt": b"",
+             "exact.bin": os.urandom(4096)}
+    _tree(tmp_path / "src", files)
+    stats = st.parallel_hydrate(tmp_path / "src", tmp_path / "dst", workers=4, chunk_bytes=4096)
+    for rel, data in files.items():
+        assert (tmp_path / "dst" / rel).read_bytes() == data
+    assert stats["bytes"] == sum(map(len, files.values()))
+    assert stats["files"] == len(files) and stats["retries"] == 0
+    assert stats["ranges"] == 3 + 1 + 0 + 1        # 10_000 B -> 3 chunks, empty file -> none
+
+
+def test_parallel_hydrate_skips_completion_marker(tmp_path):
+    _tree(tmp_path / "src", {"a.bin": b"a", st.COMPLETE_MARKER: b"repo"})
+    st.parallel_hydrate(tmp_path / "src", tmp_path / "dst", workers=2, chunk_bytes=1024)
+    assert not (tmp_path / "dst" / st.COMPLETE_MARKER).exists()
+
+
+def test_parallel_hydrate_retries_transient_fuse_errors(tmp_path, monkeypatch):
+    data = os.urandom(9000)
+    _tree(tmp_path / "src", {"w.safetensors": data})
+    real_pread, failures = os.pread, {"left": 3}
+
+    def flaky_pread(fd, n, off):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise OSError(12, "Cannot allocate memory")   # what geesefs returns when its buffer pool is full
+        return real_pread(fd, n, off)
+
+    monkeypatch.setattr(st.os, "pread", flaky_pread)
+    monkeypatch.setattr(st, "HYDRATE_RETRY_BASE_S", 0.0)
+    stats = st.parallel_hydrate(tmp_path / "src", tmp_path / "dst", workers=2, chunk_bytes=4096)
+    assert (tmp_path / "dst" / "w.safetensors").read_bytes() == data
+    assert stats["retries"] == 3
+
+
+def test_parallel_hydrate_raises_permanent_errors_with_the_path(tmp_path, monkeypatch):
+    _tree(tmp_path / "src", {"w.safetensors": b"x" * 100})
+
+    def denied(fd, n, off):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(st.os, "pread", denied)
+    with pytest.raises(OSError, match="w.safetensors"):
+        st.parallel_hydrate(tmp_path / "src", tmp_path / "dst", workers=2, chunk_bytes=64)
+
+
+def test_gshydrate_populates_once_then_hydrates_locally_without_the_hub(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_download(repo, cache_dir, token):
+        calls.append(cache_dir)
+        return make_hf_cache(Path(cache_dir), repo)
+
+    monkeypatch.setattr(st, "_download", fake_download)
+    kw = dict(models_root=str(tmp_path / "gs"), local_root=str(tmp_path / "local"), workers=4, chunk_bytes=1024)
+    first = st.acquire_gshydrate(REPO, **kw)
+    assert first.hub_online and first.notes["populated_now"]
+    (Path(first.path) / "leftover.bin").write_bytes(b"old")     # FlashBoot restart keeps container disk
+    second = st.acquire_gshydrate(REPO, **kw)
+    local = Path(second.path)
+    assert not second.hub_online and len(calls) == 1
+    assert str(local).startswith(str(tmp_path / "local"))       # loads from container disk, not the mount
+    assert (local / "model.safetensors").read_bytes() == b"x" * 4096
+    assert not (local / "leftover.bin").exists()
+    assert second.notes["leftover_bytes"] == first.bytes_total + 3   # previous hydrate + stray file
+    assert "hydrate_s" in second.timings and second.notes["hydrate"]["bytes"] == 4096 + 2
+    assert second.shared_storage_files                          # benchmark evicts these before reading
