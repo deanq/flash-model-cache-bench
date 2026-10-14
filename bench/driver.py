@@ -154,7 +154,10 @@ class Driver:
             else:
                 log(f"prime failed for {s}; excluding it from cold rounds: {t.error}")
 
-        self._each(list(self.cfg.strategies), one)
+        # Strategies sharing storage may populate the same files (globalstore and
+        # gshydrate share one folder; Global Store has no locking), so prime in waves too.
+        for wave in waves(list(self.cfg.strategies)):
+            self._each(wave, one)
         return [s for s in self.cfg.strategies if s in ok]
 
     def _cold_then_warm(self, s: str, rnd: int) -> None:

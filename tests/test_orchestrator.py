@@ -118,6 +118,18 @@ def test_cold_trial_on_warm_process_is_invalid_and_retried(tmp_path, monkeypatch
     assert len((tmp_path / "r.jsonl").read_text().splitlines()) == 3
 
 
+def test_prime_never_runs_strategies_sharing_storage_at_once(tmp_path, monkeypatch):
+    """globalstore and gshydrate populate the same Global Store folder; the store has
+    no locking (last write wins), so their first requests must not overlap."""
+    cfg = config.load({"STRATEGIES": "nocache,globalstore,gshydrate", "PARALLEL": "1"}, run_id="r")
+    rec = driver.Recorder(str(tmp_path / "r.jsonl"))
+    d = driver.Driver(cfg, FakeRp(), {"nocache": "a", "globalstore": "b", "gshydrate": "c"}, rec)
+    batches = []
+    monkeypatch.setattr(d, "_each", lambda strategies, fn: batches.append(list(strategies)))
+    d.prime()
+    assert batches == [["nocache", "globalstore"], ["gshydrate"]]
+
+
 # ---------------------------------------------------------------- report
 def trial(strategy, phase, e2e, *, acquire=None, load=1.0, hydrate=None, valid=True, worker="w", rnd=1):
     cold = None
