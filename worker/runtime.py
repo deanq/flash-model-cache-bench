@@ -27,6 +27,7 @@ def _versions() -> dict:
             out[dist] = version(dist)
         except PackageNotFoundError:
             out[dist] = None
+    out["runpod_code"] = strategies.runpod_code_version()   # the vendored tree; "runpod" is image metadata
     return out
 
 
@@ -35,18 +36,13 @@ def _acquire(strategy: str, model_id: str, token: str | None, evict: bool) -> st
         return strategies.acquire_nocache(model_id, token)
     if strategy == "volume":
         return strategies.acquire_volume(model_id, token)
-    if strategy == "volumecache":
+    if strategy in ("volumecache", "gsvolumecache"):
+        # Same code on both backends: runpod>=2.1.0's VolumeCache copies with copyfile
+        # and best-effort metadata, so it works on Global Store without a patch.
         namespace = os.environ["BENCH_NAMESPACE"]
         evicted = strategies.evict_page_cache(strategies.volumecache_mirror_files(namespace)) if evict else 0
         acq = strategies.acquire_volumecache(model_id, token, namespace=namespace)
         acq.notes["evicted_mirror_bytes"] = evicted
-        return acq
-    if strategy == "gsvolumecache":
-        namespace = os.environ["BENCH_NAMESPACE"]
-        evicted = strategies.evict_page_cache(strategies.volumecache_mirror_files(namespace)) if evict else 0
-        cls, impl = strategies.global_store_volumecache_class()
-        acq = strategies.acquire_volumecache(model_id, token, namespace=namespace, cache_cls=cls)
-        acq.notes.update(evicted_mirror_bytes=evicted, impl=impl)
         return acq
     if strategy == "modelstore":
         return strategies.acquire_modelstore(model_id, token)

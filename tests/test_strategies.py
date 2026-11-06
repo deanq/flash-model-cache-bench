@@ -137,9 +137,11 @@ def test_volumecache_populates_then_hydrates_and_relinks(tmp_path, monkeypatch):
     assert cold.notes["leftover_bytes"] > 0                   # previous local copy was wiped first
 
 
-def test_vendored_volumecache_imports():
+def test_volumecache_is_the_sdk_class():
+    from runpod.serverless import VolumeCache
+
     cls, impl = st.load_volumecache_class()
-    assert hasattr(cls, "hydrate") and impl in ("runpod", "vendored-1.12.0")
+    assert cls is VolumeCache and impl.startswith("runpod-2.")
 
 
 @pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="posix_fadvise is Linux-only")
@@ -179,27 +181,22 @@ def test_globalstore_without_marker_is_treated_as_absent(tmp_path, monkeypatch):
     assert acq.notes["populated_now"] and (partial / "model.safetensors").stat().st_size == 4096
 
 
-def test_global_store_volumecache_copies_when_metadata_is_rejected(tmp_path, monkeypatch):
+def test_sdk_volumecache_copies_when_metadata_is_rejected(tmp_path, monkeypatch):
+    """Why gsvolumecache needs no patch any more: Global Store rejects chmod/utime with
+    EPERM, and runpod>=2.1.0 treats metadata as best-effort (1.12 dropped the file)."""
+    from runpod.serverless.utils import rp_volume_cache
+
     def eperm(*a, **k):
         raise PermissionError(1, "Operation not permitted")
 
-    cls, impl = st.global_store_volumecache_class()
-    assert impl.endswith("+globalstore-copyfile")
+    monkeypatch.setattr(rp_volume_cache.os, "utime", eperm)
+    monkeypatch.setattr(rp_volume_cache.shutil, "copymode", eperm)
+    cls, _ = st.load_volumecache_class()
     src = tmp_path / "src"
     src.write_bytes(b"w" * 1000)
-    monkeypatch.setattr(st.shutil, "copystat", eperm)                 # what Global Store does
     vc = cls.__new__(cls)
     assert vc._copy_file(str(src), str(tmp_path / "mirror" / "big")) is True
     assert (tmp_path / "mirror" / "big").read_bytes() == b"w" * 1000
-    base, _ = st.load_volumecache_class()
-    assert base._copy_file(vc, str(src), str(tmp_path / "mirror" / "stock")) is False   # the stock bug
-
-
-def test_global_store_volumecache_records_copy_failures(tmp_path):
-    cls, _ = st.global_store_volumecache_class()
-    vc = cls.__new__(cls)
-    assert vc._copy_file(str(tmp_path / "missing"), str(tmp_path / "out")) is False
-    assert len(vc.copy_errors) == 1 and "FileNotFoundError" in vc.copy_errors[0]
 
 
 # ------------------------------------------------------------- gshydrate

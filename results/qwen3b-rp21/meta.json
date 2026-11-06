@@ -1,0 +1,90 @@
+{
+  "run_id": "rp21-a",
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "gpu": "ADA_24",
+  "datacenter": "EU-RO-1",
+  "volume_gb": 50,
+  "strategies": [
+    "nocache",
+    "volume",
+    "volumecache",
+    "globalstore",
+    "gshydrate"
+  ],
+  "cold_trials": 3,
+  "warm_per_cold": 1,
+  "max_new_tokens": 128,
+  "parallel": true,
+  "evict_page_cache": true,
+  "prime_timeout_s": 2700,
+  "trial_timeout_s": 1200,
+  "keep": false,
+  "started_at": 1793772060.0473752,
+  "endpoints": {
+    "volumecache": "473tditf6a0w8s",
+    "volume": "cz5sf6pgd95f0x",
+    "gshydrate": "gvhu72np507q57",
+    "nocache": "jfscqzquurcbwa",
+    "globalstore": "z5x9thhtlfby6p"
+  },
+  "app": "hfbench-rp21-a",
+  "volume_id": "7i1hf4nzca",
+  "global_store_id": "cmw1plqcb000007jmhfxacxct",
+  "attachments": {
+    "volumecache": {
+      "modelReferences": [],
+      "networkVolumeId": "7i1hf4nzca",
+      "volumes": [
+        {
+          "volumeId": "7i1hf4nzca",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "volume": {
+      "modelReferences": [],
+      "networkVolumeId": "7i1hf4nzca",
+      "volumes": [
+        {
+          "volumeId": "7i1hf4nzca",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "gshydrate": {
+      "modelReferences": [],
+      "networkVolumeId": null,
+      "volumes": [
+        {
+          "volumeId": "cmw1plqcb000007jmhfxacxct",
+          "volumeType": "OBJECT_STORE_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "nocache": {
+      "modelReferences": [],
+      "networkVolumeId": null,
+      "volumes": [],
+      "executionTimeoutMs": 1800000
+    },
+    "globalstore": {
+      "modelReferences": [],
+      "networkVolumeId": null,
+      "volumes": [
+        {
+          "volumeId": "cmw1plqcb000007jmhfxacxct",
+          "volumeType": "OBJECT_STORE_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    }
+  },
+  "finished_at": 1793772967.793013
+}

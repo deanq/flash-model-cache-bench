@@ -270,22 +270,20 @@ def _caveats(meta: dict) -> list[str]:
             ("- Cold rounds ran strategies concurrently in waves; strategies sharing storage (`volume`/`volumecache`, "
              "`globalstore`/`gsvolumecache`) were never in the same wave. (The prime phase runs all at once.)"
              if meta["parallel"] else "- Strategies ran one at a time (PARALLEL=0)."),
-            "- Model Store is attached with the console's GraphQL `modelReferences` field; Flash 1.20 has no "
-            "parameter for it.",
+            "- Model Store is declared with `model=runpod.Model(...)` on the endpoint (sets `modelReferences`).",
             *(_GLOBAL_STORE_CAVEATS if any(s in meta["strategies"] for s in ("globalstore", "gsvolumecache", "gshydrate")) else []),
             ""]
 
 
 _GLOBAL_STORE_CAVEATS = [
-    "- Global Store (beta) is attached with the console's saveEndpoint `volumes` input "
-    "(`OBJECT_STORE_VOLUME`); Flash 1.20 has no parameter for it. Its endpoints are pinned to the same "
+    "- Global Store (beta) is declared as a `runpod.GlobalVolume` mount. Its endpoints are pinned to the same "
     "datacenter as the rest for comparability, although a global volume would let them run anywhere.",
     "- Global Store is object storage behind a FUSE client (geesefs), which keeps its own memory cache that "
     "`posix_fadvise` cannot evict.",
     "- `globalstore` keeps a plain directory of real files, not an HF cache: HF snapshot symlinks written by one "
     "worker come back as 0-byte regular files on the next worker's mount.",
-    "- `gsvolumecache` uses VolumeCache with a copyfile patch: stock VolumeCache's copy2 fails (EPERM on "
-    "chmod/utime) and silently leaves every large file out of the mirror.",
+    "- `gsvolumecache` uses stock VolumeCache (runpod>=2.1.0 copies with copyfile; older releases' copy2 failed "
+    "with EPERM on chmod/utime there and silently left every large file out of the mirror).",
 ]
 
 

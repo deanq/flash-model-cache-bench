@@ -27,7 +27,7 @@ setup:
 	uv sync
 	@[ -f .env ] || { cp .env.example .env; echo "created .env from .env.example"; }
 	@uv run python -c "from bench.runpod_api import api_key; api_key(); print('Runpod API key: found')" \
-		|| { echo "-> put RUNPOD_API_KEY in .env, or run: uv run flash login"; exit 1; }
+		|| { echo "-> put RUNPOD_API_KEY in .env, or run: uv run rp login"; exit 1; }
 	@echo "setup ok — next: make run"
 
 run:

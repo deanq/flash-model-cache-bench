@@ -3,7 +3,7 @@ import json
 import pytest
 
 from bench import config, deploy, driver, report
-from bench.runpod_api import RunpodError, model_reference
+from bench.runpod_api import RunpodError
 
 
 # ---------------------------------------------------------------- config
@@ -26,21 +26,31 @@ def test_config_rejects_bad_values(env, match):
         config.load(env, run_id="r")
 
 
-def test_model_reference_matches_console_format():
-    assert model_reference("Qwen/Qwen2.5-3B-Instruct") == "qwen/qwen2.5-3b-instruct"
-    assert model_reference("A/B", "abc") == "a/b:abc"
+def test_each_run_is_its_own_app_and_deploy_env_carries_selection():
+    cfg = config.load({"STRATEGIES": "nocache,volume"}, run_id="r1")
+    assert cfg.app_name == "hfbench-r1" and cfg.uses_network_volume and not cfg.uses_global_store
+    env = cfg.deploy_env()
+    assert env["BENCH_APP"] == "hfbench-r1" and env["BENCH_STRATEGIES"] == "nocache,volume"
+    assert env["BENCH_GLOBAL_STORE_NAME"] == "hfbench-r1"
+
+
+@pytest.mark.parametrize("run_id", ["a b", "x/y", "-lead", "z" * 41])
+def test_config_rejects_run_ids_unsafe_as_resource_names(run_id):
+    with pytest.raises(config.ConfigError, match="RUN_ID"):
+        config.load({}, run_id=run_id)
 
 
 # ---------------------------------------------------------------- deploy
-def test_endpoints_from_manifest_keys_by_strategy():
-    manifest = {"resources": {"hfbench-volume": {"endpoint_id": "e1"}, "hfbench-nocache": {"endpoint_id": "e2"},
-                              "other": {"endpoint_id": "x"}, "hfbench-modelstore": {}}}
-    assert deploy.endpoints_from_manifest(manifest) == {"volume": "e1", "nocache": "e2"}
+def test_endpoints_from_environment_keys_by_strategy():
+    environment = {"endpoints": [{"id": "e1", "name": "hfbench-volume"}, {"id": "e2", "name": "hfbench-nocache"},
+                                 {"id": "x", "name": "other"}]}
+    assert deploy.endpoints_from_environment(environment) == {"volume": "e1", "nocache": "e2"}
+    assert deploy.endpoints_from_environment(None) == {}
 
 
 class FakeRp:
-    def __init__(self, endpoints=(), volumes=()):
-        self.endpoints, self.volumes = list(endpoints), list(volumes)
+    def __init__(self, endpoints=(), volumes=(), apps=()):
+        self.endpoints, self.volumes, self.apps = list(endpoints), list(volumes), set(apps)
         self.workers_max: dict[str, int] = {}
         self.health_seq: dict[str, list[dict]] = {}
         self.jobs: dict[str, list[dict]] = {}
@@ -50,6 +60,12 @@ class FakeRp:
 
     def list_network_volumes(self):
         return self.volumes
+
+    def list_global_stores(self):
+        return []
+
+    def flash_app_exists(self, app):
+        return app in self.apps
 
     def set_workers_max(self, eid, n):
         self.workers_max[eid] = n
@@ -68,12 +84,15 @@ class FakeRp:
         pass
 
 
-def test_verify_clean_reports_leftover_endpoints_and_volume():
-    state = deploy.State("r", "app", "env", "hfbench-r", endpoints={"volume": "e1"}, volume_id="v1")
-    rp = FakeRp(endpoints=[{"id": "e1", "name": "x"}, {"id": "z", "name": "hfbench-nocache"}, {"id": "o", "name": "mine"}],
-                volumes=[{"id": "v1", "name": "hfbench-r"}, {"id": "v2", "name": "keep-me"}])
-    left = deploy.verify_clean(state, rp)
-    assert len(left) == 3 and not any("keep-me" in x or "mine" in x for x in left)
+def test_verify_clean_reports_only_this_runs_leftovers():
+    """The account is shared: same-named endpoints of other apps/runs are not ours."""
+    state = deploy.State("r", "hfbench-r", "env", "hfbench-r", endpoints={"volume": "e1"}, volume_id="v1")
+    rp = FakeRp(endpoints=[{"id": "e1", "name": "hfbench-volume"}, {"id": "z", "name": "hfbench-nocache"},
+                           {"id": "o", "name": "mine"}],
+                volumes=[{"id": "v1", "name": "hfbench-r"}, {"id": "v2", "name": "keep-me"}],
+                apps={"hfbench-r", "hfbench-other-run"})
+    assert deploy.verify_clean(state, rp) == [
+        "flash app hfbench-r", "endpoint hfbench-volume (e1)", "network volume hfbench-r (v1)"]
 
 
 # ---------------------------------------------------------------- driver
@@ -199,25 +218,41 @@ def test_hub_column_is_empty_when_hub_never_used():
     assert s["volume"]["hub"].n == 0
 
 
-def test_update_endpoint_carries_global_volume_and_model_refs():
-    from bench.runpod_api import Runpod, OBJECT_STORE_VOLUME
-    rp = Runpod.__new__(Runpod)
-    sent = {}
-    ep = {"id": "e", "name": "n", "workersMax": 1, "modelReferences": ["m"],
-          "volumes": [{"volumeId": "g", "volumeType": OBJECT_STORE_VOLUME, "mountPath": "/runpod-volume"},
-                      {"volumeId": "nv", "volumeType": "NETWORK_VOLUME", "mountPath": "/runpod-volume"}]}
-    rp.endpoint = lambda eid: ep
-    rp.graphql = lambda q, v: sent.update(v["input"]) or {"saveEndpoint": {"id": "e"}}
-    rp.update_endpoint("e", workersMax=0)
-    assert sent["workersMax"] == 0 and sent["modelReferences"] == ["m"]
-    assert sent["volumes"] == [{"volumeId": "g", "volumeType": OBJECT_STORE_VOLUME}]
+def test_set_workers_max_patches_only_the_workers_block():
+    """A partial REST update cannot drop modelReferences, volumes or the Flash
+    environment binding, which a GraphQL saveEndpoint upsert would have to resend."""
+    import httpx
+    from bench.runpod_api import Runpod
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.content))
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "e", "workers": {"min": 0, "max": 1, "idleTimeout": 5}})
+        return httpx.Response(200, json={"id": "e"})
+
+    rp = Runpod(key="k", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    rp.set_workers_max("e", 0)
+    assert [(m, p) for m, p, _ in seen] == [("GET", "/v2/serverless/e"), ("PATCH", "/v2/serverless/e")]
+    assert json.loads(seen[1][2]) == {"workers": {"min": 0, "max": 0, "idleTimeout": 5}}
+
+
+def test_set_workers_max_raises_on_api_error():
+    import httpx
+    from bench.runpod_api import Runpod
+
+    rp = Runpod(key="k", client=httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(404, text="not found"))))
+    with pytest.raises(RunpodError, match="read endpoint e: HTTP 404"):
+        rp.set_workers_max("e", 0)
 
 
 def test_verify_clean_reports_leftover_global_store():
     state = deploy.State("r", "app", "env", "hfbench-r", global_store_name="hfbench-r", global_store_id="g1")
     rp = FakeRp()
     rp.list_global_stores = lambda: [{"id": "g1", "name": "hfbench-r"}, {"id": "g2", "name": "someone-else"}]
-    assert deploy.verify_clean(state, rp) == ["global store hfbench-r (g1)"]
+    assert deploy.verify_clean(state, rp) == ["global volume hfbench-r (g1)"]
 
 
 def test_old_state_files_without_global_store_fields_still_load(tmp_path, monkeypatch):
@@ -233,3 +268,52 @@ def test_config_knows_global_store_strategies():
     assert config.load({"STRATEGIES": "nocache"}, run_id="r").uses_global_store is False
     cfg = config.load({"STRATEGIES": "globalstore"}, run_id="r")
     assert cfg.uses_global_store and cfg.global_store_name == "hfbench-r"
+
+
+def test_verify_attachments_fails_when_deploy_did_not_attach_storage():
+    cfg = config.load({"STRATEGIES": "modelstore,globalstore"}, run_id="r")
+    state = deploy.State("r", "hfbench-r", "env", "hfbench-r", endpoints={"modelstore": "m", "globalstore": "g"},
+                         global_store_name="hfbench-r", global_store_id="gv")
+    rp = FakeRp()
+    eps = {"m": {"modelReferences": ["https://huggingface.co/Qwen/X:abc"]},
+           "g": {"volumes": [{"volumeId": "gv", "volumeType": "OBJECT_STORE_VOLUME"}]}}
+    rp.endpoint = lambda eid: eps[eid]
+    assert deploy.verify_attachments(cfg, state, rp)["modelstore"]["modelReferences"]
+    eps["g"] = {"volumes": []}
+    with pytest.raises(RunpodError, match="globalstore .*not attached"):
+        deploy.verify_attachments(cfg, state, rp)
+
+
+# ---------------------------------------------------------------- worker app
+def _load_bench_app(monkeypatch, **env):
+    import importlib
+    import sys
+
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    sys.modules.pop("bench_app", None)
+    return importlib.import_module("bench_app")
+
+
+def test_bench_app_registers_only_selected_strategies_with_their_storage(monkeypatch):
+    app_mod = _load_bench_app(monkeypatch, BENCH_RUN_ID="t1", BENCH_APP="hfbench-t1",
+                              BENCH_STRATEGIES="nocache,volumecache,modelstore,gshydrate")
+    specs = {name: h.spec for name, h in app_mod.app.resources.items()}
+    assert app_mod.app.name == "hfbench-t1"
+    assert sorted(specs) == ["hfbench-gshydrate", "hfbench-modelstore", "hfbench-nocache", "hfbench-volumecache"]
+    manifest = {n: s.to_manifest() for n, s in specs.items()}
+    assert manifest["hfbench-volumecache"]["mounts"] == [
+        {"kind": "network", "reference": "hfbench-t1", "path": "/runpod-volume"}]
+    assert manifest["hfbench-gshydrate"]["mounts"] == [
+        {"kind": "global", "reference": "hfbench-t1", "path": "/runpod-volume"}]
+    assert "mounts" not in manifest["hfbench-nocache"]
+    assert manifest["hfbench-modelstore"]["model"] == "Qwen/Qwen2.5-3B-Instruct"
+    nocache = manifest["hfbench-nocache"]
+    assert (nocache["workersMin"], nocache["workersMax"], nocache["idleTimeout"]) == (0, 1, 5)
+    assert nocache["executionTimeoutMs"] == 30 * 60 * 1000 and nocache["locations"] == "EU-RO-1"
+    assert nocache["dependencies"] == app_mod.DEPENDENCIES
+    # the worker imports the module too: it must see the same app and selection
+    env = nocache["env"]
+    assert env["BENCH_APP"] == "hfbench-t1" and env["BENCH_STRATEGIES"] == "nocache,volumecache,modelstore,gshydrate"
+    # unselected strategies stay plain functions (not deployed); selected ones keep their names
+    assert not hasattr(app_mod.hfbench_volume, "spec") and app_mod.hfbench_nocache.spec.name == "hfbench-nocache"

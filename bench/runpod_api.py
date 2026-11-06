@@ -1,16 +1,18 @@
-"""Thin Runpod API client for what the Flash CLI does not cover.
+"""Thin Runpod API client for what `rp flash` does not cover.
 
 - invoking deployed endpoints and reading job timing (/run, /status, /health)
-- attaching a Model Store cached model (GraphQL `modelReferences`) -- Flash
-  1.20 has no field for it, and the REST API does not expose it either
-- creating/attaching/deleting a Global Store volume (GraphQL
-  `globalStoreBucket*` and saveEndpoint `volumes`) -- same story
-- deleting the network volume and listing leftovers during teardown
+- toggling workersMax to force cold starts (REST v2 PATCH, as `rp endpoint scale` does)
+- reading back a deployed environment's endpoints and their attachments
+- deleting the storage `rp flash app delete` leaves behind (network volume,
+  global volume) and listing leftovers during teardown
 
-Lifecycle (deploy/undeploy) stays with the `flash` CLI.
+Lifecycle (deploy, Model Store and Global Store attachment, undeploy) is
+`rp flash` (runpod>=2.1.0): `model=` and `GlobalVolume` mounts replaced the
+console GraphQL calls this harness needed with Flash 1.20.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import tomllib
@@ -19,10 +21,11 @@ from pathlib import Path
 import httpx
 
 REST = "https://rest.runpod.io/v1"
+REST_V2 = "https://api.runpod.io/v2"
 GRAPHQL = "https://api.runpod.io/graphql"
 SERVERLESS = "https://api.runpod.ai/v2"
 # Cloudflare in front of rest.runpod.io rejects requests without a User-Agent (403/1010).
-USER_AGENT = "flash-model-cache-bench/0.1"
+USER_AGENT = "flash-model-cache-bench/0.2"
 TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 PAUSED_POLL_S = 2.0
 
@@ -32,7 +35,7 @@ class RunpodError(RuntimeError):
 
 
 def api_key() -> str:
-    """RUNPOD_API_KEY, else the key `flash login` / runpodctl stored."""
+    """RUNPOD_API_KEY, else the key `rp login` / runpodctl stored."""
     key = os.environ.get("RUNPOD_API_KEY")
     if key:
         return key
@@ -42,7 +45,7 @@ def api_key() -> str:
         key = data.get("api_key") or data.get("default", {}).get("api_key")
         if key:
             return key
-    raise RunpodError("no Runpod API key: set RUNPOD_API_KEY in .env or run `uv run flash login`")
+    raise RunpodError("no Runpod API key: set RUNPOD_API_KEY in .env or run `uv run rp login`")
 
 
 class Runpod:
@@ -87,62 +90,63 @@ class Runpod:
         return body["data"]
 
     def endpoint(self, endpoint_id: str) -> dict:
+        """Read-only view of a deployed endpoint, used to verify what `rp flash deploy` attached."""
         eps = self.graphql(_ENDPOINTS_QUERY)["myself"]["endpoints"]
         ep = next((e for e in eps if e["id"] == endpoint_id), None)
         if not ep:
             raise RunpodError(f"endpoint {endpoint_id} not found")
         return ep
 
-    def update_endpoint(self, endpoint_id: str, **changes) -> dict:
-        """saveEndpoint is an upsert: send the full current config back with only
-        `changes` applied. modelReferences and attached global volumes are carried
-        over so a later update (e.g. a workersMax toggle) does not detach them."""
-        ep = self.endpoint(endpoint_id)
-        payload = {k: ep[k] for k in _SAVE_FIELDS if ep.get(k) is not None}
-        if ep.get("modelReferences"):
-            payload["modelReferences"] = ep["modelReferences"]
-        global_volumes = _global_volume_inputs(ep.get("volumes"))
-        if global_volumes:
-            payload["volumes"] = global_volumes
-        payload.update(changes)
-        return self.graphql(_SAVE_MUTATION, {"input": payload})["saveEndpoint"]
-
-    def attach_global_volume(self, endpoint_id: str, volume_id: str) -> dict:
-        """Attach a Global Store volume (mounts at /runpod-volume). Flash 1.20 and
-        REST v2 cannot; this is the console's saveEndpoint `volumes` input."""
-        self.update_endpoint(endpoint_id, volumes=[{"volumeId": volume_id, "volumeType": OBJECT_STORE_VOLUME}])
-        attached = [v["volumeId"] for v in self.endpoint(endpoint_id).get("volumes") or []
-                    if v.get("volumeType") == OBJECT_STORE_VOLUME]
-        if attached != [volume_id]:
-            raise RunpodError(f"global volume {volume_id} not attached to {endpoint_id}: {attached}")
-        return {"id": endpoint_id, "globalVolume": volume_id}
-
-    def set_model_references(self, endpoint_id: str, refs: list[str]) -> dict:
-        """Attach Model Store cached model(s)."""
-        saved = self.update_endpoint(endpoint_id, modelReferences=refs)
-        # The API normalizes "org/name" to "https://huggingface.co/Org/Name:<commit>".
-        persisted = [r.lower() for r in saved.get("modelReferences") or []]
-        if len(persisted) != len(refs) or not all(ref.split(":")[0] in got for ref, got in zip(refs, persisted)):
-            raise RunpodError(f"saveEndpoint did not persist modelReferences={refs}: {saved}")
-        return saved
-
     def set_workers_max(self, endpoint_id: str, n: int) -> dict:
-        return self.update_endpoint(endpoint_id, workersMax=n)
+        """REST v2 partial update, like `rp endpoint scale --max-workers`: only the
+        workers block changes, so modelReferences, volumes and the Flash
+        environment binding are left alone (a GraphQL saveEndpoint is a full upsert)."""
+        url = f"{REST_V2}/serverless/{endpoint_id}"
+        current = self._http.get(url)
+        _raise_for(current, f"read endpoint {endpoint_id}")
+        workers = {**(current.json().get("workers") or {}), "max": n}
+        r = self._http.patch(url, json={"workers": workers})
+        _raise_for(r, f"set workersMax={n} on {endpoint_id}")
+        return r.json()
 
     def list_endpoints(self) -> list[dict]:
         return self.graphql("query { myself { endpoints { id name } } }")["myself"]["endpoints"]
 
+    # ----------------------------------------------------------- flash apps
+    def flash_environment(self, app: str, env: str) -> dict | None:
+        """The deployed environment with its endpoints ({id, name}), or None."""
+        return self._apps(lambda c: c.get_environment_by_name(app, env))
+
+    def flash_app_exists(self, app: str) -> bool:
+        return self._apps(lambda c: c.get_app_by_name(app)) is not None
+
+    def _apps(self, call):
+        from runpod.apps.api import AppsApiClient
+
+        async def go():
+            return await call(AppsApiClient(api_key=self._key))
+        try:
+            return asyncio.run(go())
+        except Exception as e:  # noqa: BLE001 - SDK raises several types; callers handle one
+            raise RunpodError(f"flash app API: {type(e).__name__}: {e}") from e
+
     # --------------------------------------------------------- global store
-    def create_global_store(self, name: str) -> str:
-        data = self.graphql(_GS_CREATE, {"input": {"name": name}})
-        return data["globalStoreBucketCreate"]["id"]
-
     def list_global_stores(self) -> list[dict]:
-        return self.graphql("query { myself { globalStoreBuckets { id name } } }")["myself"]["globalStoreBuckets"]
+        """Global volumes (REST v2), the API `runpod.GlobalVolume` creates them with."""
+        from runpod.apps.api import AppsApiClient
 
-    def delete_global_store(self, bucket_id: str) -> None:
-        if not self.graphql(_GS_DELETE, {"input": {"id": bucket_id}})["globalStoreBucketDelete"]:
-            raise RunpodError(f"globalStoreBucketDelete returned false for {bucket_id}")
+        async def go():
+            return await AppsApiClient(api_key=self._key).list_global_volumes()
+        try:
+            return asyncio.run(go())
+        except Exception as e:  # noqa: BLE001
+            raise RunpodError(f"list global volumes: {type(e).__name__}: {e}") from e
+
+    def delete_global_store(self, volume_id: str) -> None:
+        r = self._http.delete(f"{REST_V2}/global-volumes/{volume_id}")
+        if r.status_code == 404:
+            return
+        _raise_for(r, f"delete global volume {volume_id}")
 
     # -------------------------------------------------------------- volumes
     def list_network_volumes(self) -> list[dict]:
@@ -157,28 +161,11 @@ class Runpod:
         _raise_for(r, f"delete network volume {volume_id}")
 
 
-def model_reference(repo_id: str, revision: str | None = None) -> str:
-    """Console format: org/name[:revision], lowercased."""
-    ref = repo_id if not revision else f"{repo_id}:{revision}"
-    return ref.lower()
-
-
-def _global_volume_inputs(volumes) -> list[dict]:
-    return [{"volumeId": v["volumeId"], "volumeType": OBJECT_STORE_VOLUME}
-            for v in volumes or [] if v.get("volumeType") == OBJECT_STORE_VOLUME]
-
-
 def _raise_for(r: httpx.Response, what: str) -> None:
     if r.is_success:
         return
     raise RunpodError(f"{what}: HTTP {r.status_code}: {r.text[:500]}")
 
-
-OBJECT_STORE_VOLUME = "OBJECT_STORE_VOLUME"   # Global Store volume type in EndpointInput.volumes
-
-_SAVE_FIELDS = ("id", "name", "templateId", "gpuIds", "gpuCount", "workersMin", "workersMax", "idleTimeout",
-                "locations", "networkVolumeId", "scalerType", "scalerValue", "flashBootType",
-                "executionTimeoutMs", "type", "allowedCudaVersions", "minCudaVersion", "flashEnvironmentId")
 
 _ENDPOINTS_QUERY = """
 query {
@@ -188,19 +175,4 @@ query {
     allowedCudaVersions minCudaVersion flashEnvironmentId modelReferences
     volumes { volumeId volumeType mountPath }
   } }
-}"""
-
-_SAVE_MUTATION = """
-mutation saveEndpoint($input: EndpointInput!) {
-  saveEndpoint(input: $input) { id name modelReferences workersMax idleTimeout }
-}"""
-
-_GS_CREATE = """
-mutation globalStoreBucketCreate($input: GlobalStoreBucketCreateInput!) {
-  globalStoreBucketCreate(input: $input) { id name }
-}"""
-
-_GS_DELETE = """
-mutation globalStoreBucketDelete($input: GlobalStoreBucketDeleteInput!) {
-  globalStoreBucketDelete(input: $input)
 }"""

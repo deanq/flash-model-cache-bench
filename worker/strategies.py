@@ -18,9 +18,10 @@ Every strategy resolves offline first and only calls the Hub when the files are
 not already usable -- that is the best-practice version of each strategy, and
 `hub_online` in the result records when a strategy could not avoid the network.
 
-Local caches deliberately live outside /root/.cache: flash-worker tars new files
-under /root/.cache onto an attached network volume, which would silently turn
-every strategy into a volume-backed one.
+Local caches deliberately live outside /root/.cache: the Flash 1.x worker tarred
+new files under /root/.cache onto an attached network volume, which would
+silently turn every strategy into a volume-backed one. Keeping them elsewhere
+stays correct whatever the runtime does with that directory.
 
 This module is imported by the Flash worker as a top-level module (worker/ is
 the deploy root), and by the unit tests.
@@ -162,13 +163,23 @@ def acquire_volume(repo_id: str, token: str | None = None, *, hub_root: str = VO
 
 
 def load_volumecache_class():
-    """Prefer the runpod SDK's VolumeCache; fall back to the vendored 1.12.0 copy."""
+    """The runpod SDK's VolumeCache. `rp flash deploy` vendors the deploying client's
+    runpod package (>= 2.1.0) into the artifact, so the worker always has it."""
+    from runpod.serverless import VolumeCache
+
+    return VolumeCache, f"runpod-{runpod_code_version()}"
+
+
+def runpod_code_version() -> str:
+    """Version of the runpod code actually imported. `runpod.__version__` reads the
+    installed dist metadata, which on a Flash worker is the image's runpod (2.0.0 on
+    the 2026-11 images) even though the artifact's vendored 2.1.0 tree is what runs."""
     try:
-        from runpod.serverless import VolumeCache  # runpod>=1.12.0
-        return VolumeCache, "runpod"
+        from runpod._version import __version__
+        return __version__
     except ImportError:
-        from vendor.rp_volume_cache import VolumeCache
-        return VolumeCache, "vendored-1.12.0"
+        import runpod
+        return f"{runpod.__version__}(metadata)"
 
 
 def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: str,
@@ -209,8 +220,7 @@ def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: st
                     hub_online="hub_s" in t or "download_s" in t,
                     notes={"impl": impl, "files_hydrated": restored, "hydrated_bytes": hydrated_bytes,
                            "hub_fetched_bytes": fetched, "synced": synced, "leftover_bytes": leftover,
-                           "mirror_bytes_after_sync": mirror_bytes,
-                           "copy_errors": getattr(vc, "copy_errors", [])[:5]})
+                           "mirror_bytes_after_sync": mirror_bytes})
 
 
 def _resolve_or_download_linked(repo_id: str, hub_root: str, token: str | None, t: dict) -> tuple[Path, bool]:
@@ -237,7 +247,7 @@ def acquire_modelstore(repo_id: str, token: str | None = None, *, hub_root: str 
         listing = sorted(p.name for p in Path(hub_root).iterdir()) if Path(hub_root).is_dir() else "missing"
         raise FileNotFoundError(
             f"cached model {repo_id} not staged under {hub_root} (contents: {listing}); "
-            f"is modelReferences set on this endpoint?")
+            f"is model= (modelReferences) set on this endpoint?")
     files = snapshot_files(snap)
     return Acquired(path=str(snap), timings={"resolve_s": time.monotonic() - t0},
                     bytes_total=sum(p.stat().st_size for p in files),
@@ -373,47 +383,6 @@ def copy_real_files(snapshot: Path, target: Path) -> int:
         shutil.copyfile(src.resolve(), dst)
         copied += dst.stat().st_size
     return copied
-
-
-def global_store_volumecache_class():
-    """VolumeCache that works on Global Store.
-
-    Stock VolumeCache mirrors big files with shutil.copy2, whose copystat
-    (chmod/utime) raises EPERM on Global Store; _copy_file swallows the error,
-    so every file >= 256 KiB is silently left out of the mirror and each cold
-    start re-downloads the weights. This subclass copies data with copyfile and
-    applies metadata only where the filesystem allows it. Mirror mtimes then
-    reflect upload time (newer than the source), which the size/mtime diff
-    tolerates: hydrate copies them because the local file is missing, and
-    copystat onto local disk makes the next comparison converge.
-    """
-    import threading
-
-    base, impl = load_volumecache_class()
-
-    class GlobalStoreVolumeCache(base):
-        # Stock VolumeCache logs copy failures at debug level and moves on; keep
-        # them so the benchmark can report what was skipped and why.
-        copy_errors: list[str]
-
-        def _copy_file(self, src, dst):
-            tmp = f"{dst}.{os.getpid()}.{threading.get_ident()}.rpvc.tmp"
-            try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copyfile(src, tmp)
-                try:
-                    shutil.copystat(src, tmp)
-                except OSError:
-                    pass      # Global Store: no chmod/utime; data is what matters
-                os.replace(tmp, dst)
-                return True
-            except OSError as exc:
-                self.__dict__.setdefault("copy_errors", []).append(f"{src}: {type(exc).__name__}: {exc}")
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                return False
-
-    return GlobalStoreVolumeCache, f"{impl}+globalstore-copyfile"
 
 
 def evict_page_cache(paths: list[str]) -> int:

@@ -1,25 +1,25 @@
-"""Deploy/teardown via the flash CLI, plus the pieces Flash cannot do yet.
+"""Deploy/teardown via the `rp flash` CLI (runpod>=2.1.0), plus the cleanup it does not do.
 
-State is written to runs/<id>/state.json *before* anything is created, and
-updated as resources appear, so `make clean` can always finish a teardown that
-a crashed or interrupted run started.
+Each run is its own Flash app (`hfbench-<run id>`), so `rp flash app delete`
+only ever removes this run's endpoints. State is written to
+runs/<id>/state.json *before* anything is created, and updated as resources
+appear, so `make clean` can always finish a teardown that a crashed or
+interrupted run started.
 """
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 
-from bench.config import APP_NAME, GLOBAL_STORE_STRATEGIES, Config
-from bench.runpod_api import Runpod, RunpodError, model_reference
+from bench.config import GLOBAL_STORE_STRATEGIES, RESOURCE_PREFIX, Config
+from bench.runpod_api import Runpod, RunpodError, api_key
 
 WORKER_DIR = "worker"
-MANIFEST = os.path.join(WORKER_DIR, ".flash", "flash_manifest.json")
-ENDPOINT_PREFIX = "hfbench-"
+ENDPOINT_PREFIX = RESOURCE_PREFIX   # endpoint name = resource name = hfbench-<strategy>
 
 
 @dataclass
@@ -53,70 +53,79 @@ def log(msg: str) -> None:
     print(f"[bench] {msg}", flush=True)
 
 
-def _flash(args: list[str], extra_env: dict[str, str] | None = None, check: bool = True,
-           stdin: str | None = None, quiet: bool = False) -> subprocess.CompletedProcess:
-    cmd = [_flash_bin(), *args]
-    return subprocess.run(cmd, cwd=WORKER_DIR, env={**os.environ, **(extra_env or {})}, check=check,
-                          text=True, input=stdin, capture_output=quiet)
+def _rp(args: list[str], extra_env: dict[str, str] | None = None, check: bool = True,
+        quiet: bool = False) -> subprocess.CompletedProcess:
+    env = {**os.environ, "RUNPOD_API_KEY": api_key(), **(extra_env or {})}
+    return subprocess.run([_rp_bin(), *args], cwd=WORKER_DIR, env=env, check=check, text=True,
+                          stdin=subprocess.DEVNULL, capture_output=quiet)
 
 
-def _flash_bin() -> str:
-    """The flash CLI pinned in this project's venv, not whatever is on PATH."""
-    local = os.path.join(os.path.dirname(sys.executable), "flash")
-    return local if os.path.exists(local) else "flash"
+def _rp_bin() -> str:
+    """The rp CLI pinned in this project's venv, not whatever is on PATH."""
+    local = os.path.join(os.path.dirname(sys.executable), "rp")
+    return local if os.path.exists(local) else "rp"
 
 
-def endpoints_from_manifest(manifest: dict) -> dict[str, str]:
+def endpoints_from_environment(environment: dict | None) -> dict[str, str]:
+    """strategy -> endpoint id, from a Flash environment's {id, name} endpoints."""
     out = {}
-    for name, res in manifest.get("resources", {}).items():
-        if name.startswith(ENDPOINT_PREFIX) and res.get("endpoint_id"):
-            out[name[len(ENDPOINT_PREFIX):]] = res["endpoint_id"]
+    for ep in (environment or {}).get("endpoints") or []:
+        if ep["name"].startswith(ENDPOINT_PREFIX):
+            out[ep["name"][len(ENDPOINT_PREFIX):]] = ep["id"]
     return out
 
 
 def deploy(cfg: Config, rp: Runpod) -> State:
-    state = State(run_id=cfg.run_id, app=APP_NAME, env=cfg.env_name, volume_name=cfg.volume_name,
+    state = State(run_id=cfg.run_id, app=cfg.app_name, env=cfg.env_name, volume_name=cfg.volume_name,
                   global_store_name=cfg.global_store_name if cfg.uses_global_store else "")
     state.save()
-    if cfg.uses_global_store:
-        state.global_store_id = rp.create_global_store(cfg.global_store_name)
+    log(f"deploying app={cfg.app_name} env={cfg.env_name} model={cfg.model} gpu={cfg.gpu} dc={cfg.datacenter} "
+        f"strategies={','.join(cfg.strategies)}")
+    try:
+        _rp(["flash", "deploy", "--env", cfg.env_name], cfg.deploy_env())
+    finally:
+        # Record whatever was created, even if the deploy failed half way.
+        state.endpoints = endpoints_from_environment(_environment_or_none(rp, state))
+        if cfg.uses_network_volume:
+            state.volume_id = find_volume_id(rp, cfg.volume_name)
+        if cfg.uses_global_store:
+            state.global_store_id = find_global_store_id(rp, cfg.global_store_name)
         state.save()
-        log(f"created global store {cfg.global_store_name} ({state.global_store_id})")
-    log(f"deploying app={APP_NAME} env={cfg.env_name} model={cfg.model} gpu={cfg.gpu} dc={cfg.datacenter}")
-    # Flash caches provisioned resources in worker/.flash/resources.pkl and tries
-    # to *update* them on the next deploy; after a teardown those ids are gone
-    # ("Endpoint not found"). Every run provisions from scratch.
-    shutil.rmtree(os.path.join(WORKER_DIR, ".flash"), ignore_errors=True)
-    _flash(["deploy", "--app", APP_NAME, "--env", cfg.env_name], cfg.deploy_env())
-    with open(MANIFEST) as fh:
-        state.endpoints = endpoints_from_manifest(json.load(fh))
-    state.volume_id = find_volume_id(rp, cfg.volume_name)
-    state.save()
     missing = [s for s in cfg.strategies if s not in state.endpoints]
     if missing:
-        raise RunpodError(f"deploy did not produce endpoints for {missing}; manifest has {state.endpoints}")
-    log(f"endpoints: {state.endpoints}  volume: {state.volume_id}")
+        raise RunpodError(f"deploy did not produce endpoints for {missing}; environment has {state.endpoints}")
+    log(f"endpoints: {state.endpoints}  volume: {state.volume_id}  global store: {state.global_store_id}")
     return state
 
 
-def attach_cached_model(cfg: Config, state: State, rp: Runpod) -> str | None:
-    """Model Store needs modelReferences on the endpoint. Flash 1.20 has no field
-    for it, so it is set with the same GraphQL mutation the console uses."""
-    eid = state.endpoints.get("modelstore")
-    if eid is None:
+def _environment_or_none(rp: Runpod, state: State) -> dict | None:
+    try:
+        return rp.flash_environment(state.app, state.env)
+    except RunpodError as e:
+        log(f"warning: could not read environment {state.app}/{state.env}: {e}")
         return None
-    saved = rp.set_model_references(eid, [model_reference(cfg.model)])
-    ref = saved["modelReferences"][0]
-    log(f"modelstore: attached cached model {ref}")
-    return ref
 
 
-def attach_global_store(cfg: Config, state: State, rp: Runpod) -> None:
-    """Global Store endpoints get the run's global volume after deploy."""
-    for s in GLOBAL_STORE_STRATEGIES:
-        if s in cfg.strategies and s in state.endpoints:
-            rp.attach_global_volume(state.endpoints[s], state.global_store_id)
-            log(f"{s}: attached global store {state.global_store_id}")
+def verify_attachments(cfg: Config, state: State, rp: Runpod) -> dict:
+    """Check that the deploy attached what the strategies need: the cached model on
+    `modelstore`, the run's global volume on Global Store endpoints, and the
+    network volume on `volume`/`volumecache`. Returns what was found, for meta.json."""
+    found: dict = {}
+    for s, eid in state.endpoints.items():
+        ep = rp.endpoint(eid)
+        found[s] = {"modelReferences": ep.get("modelReferences"), "networkVolumeId": ep.get("networkVolumeId"),
+                    "volumes": ep.get("volumes"), "executionTimeoutMs": ep.get("executionTimeoutMs")}
+        problems = []
+        if s == "modelstore" and not ep.get("modelReferences"):
+            problems.append("no modelReferences")
+        if s in GLOBAL_STORE_STRATEGIES:
+            ids = [v.get("volumeId") for v in ep.get("volumes") or []]
+            if state.global_store_id not in ids:
+                problems.append(f"global volume {state.global_store_id} not attached (volumes={ids})")
+        if problems:
+            raise RunpodError(f"{s} ({eid}): {'; '.join(problems)}")
+    log(f"attachments verified: {json.dumps(found)}")
+    return found
 
 
 def find_volume_id(rp: Runpod, name: str) -> str | None:
@@ -125,20 +134,22 @@ def find_volume_id(rp: Runpod, name: str) -> str | None:
 
 
 def teardown(state: State, rp: Runpod) -> list[str]:
-    """Delete the Flash app (all its endpoints), the run's network volume and global store, then
-    verify nothing is left. Returns human-readable leftovers (empty = clean)."""
-    log(f"teardown: deleting app {state.app}")
-    res = _flash(["app", "delete", state.app], check=False, stdin="y\n")
-    if res.returncode != 0:
-        log(f"warning: `flash app delete {state.app}` exited {res.returncode}; checking what is left")
+    """Delete the run's Flash app (all its endpoints), then its network volume and global
+    volume, which `rp flash app delete` leaves behind; verify nothing is left.
+    Returns human-readable leftovers (empty = clean)."""
+    if rp.flash_app_exists(state.app):
+        log(f"teardown: deleting app {state.app}")
+        res = _rp(["flash", "app", "delete", state.app, "--yes"], check=False)
+        if res.returncode != 0:
+            log(f"warning: `rp flash app delete {state.app}` exited {res.returncode}; checking what is left")
     volume_id = state.volume_id or find_volume_id(rp, state.volume_name)
     if volume_id:
         log(f"teardown: deleting network volume {state.volume_name} ({volume_id})")
         _with_retry(lambda: rp.delete_network_volume(volume_id), f"delete volume {volume_id}")
     store_id = state.global_store_id or find_global_store_id(rp, state.global_store_name)
     if store_id:
-        log(f"teardown: deleting global store {state.global_store_name} ({store_id})")
-        _with_retry(lambda: rp.delete_global_store(store_id), f"delete global store {store_id}")
+        log(f"teardown: deleting global volume {state.global_store_name} ({store_id})")
+        _with_retry(lambda: rp.delete_global_store(store_id), f"delete global volume {store_id}")
     leftovers = verify_clean(state, rp)
     state.torn_down = not leftovers
     state.save()
@@ -166,10 +177,14 @@ def _with_retry(fn, what: str, attempts: int = 6, wait_s: float = 10) -> None:
 
 
 def verify_clean(state: State, rp: Runpod) -> list[str]:
+    """Only this run's resources count: its app, the endpoint ids it recorded, and the
+    volume/global volume named after it. Other deployments in the account are ignored."""
     left = []
+    if rp.flash_app_exists(state.app):
+        left.append(f"flash app {state.app}")
     ids = set(state.endpoints.values())
     for ep in rp.list_endpoints():
-        if ep["id"] in ids or ep["name"].startswith(ENDPOINT_PREFIX):
+        if ep["id"] in ids:
             left.append(f"endpoint {ep['name']} ({ep['id']})")
     for v in rp.list_network_volumes():
         if v.get("name") == state.volume_name or v.get("id") == state.volume_id:
@@ -177,5 +192,5 @@ def verify_clean(state: State, rp: Runpod) -> list[str]:
     if state.global_store_name or state.global_store_id:
         for b in rp.list_global_stores():
             if b.get("name") == state.global_store_name or b.get("id") == state.global_store_id:
-                left.append(f"global store {b['name']} ({b['id']})")
+                left.append(f"global volume {b['name']} ({b['id']})")
     return left

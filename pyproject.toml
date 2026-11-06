@@ -1,12 +1,12 @@
 [project]
 name = "flash-model-cache-bench"
 version = "0.1.0"
-description = "Benchmark Hugging Face model-loading strategies on Runpod Flash serverless GPUs"
+description = "Benchmark Hugging Face model-loading strategies on Runpod Flash (runpod.apps) serverless GPUs"
 requires-python = ">=3.11"
 dependencies = [
-    "runpod-flash==1.20.0",
+    "runpod==2.1.0",
     "httpx>=0.27",
-    "pip>=24",  # flash build installs dependencies with pip from this venv
+    "pip>=24",  # `rp flash deploy` vendors dependencies with pip from this venv
 ]
 
 [dependency-groups]

@@ -2,8 +2,9 @@
 
 **What is the fastest way to get a Hugging Face model onto a Runpod Serverless GPU on a cold start?**
 
-This repo benchmarks six model-storage strategies side by side on real Runpod Serverless GPU
-workers deployed with [Runpod Flash](https://github.com/runpod/flash). It measures the whole AI
+This repo benchmarks seven model-storage strategies side by side on real Runpod Serverless GPU
+workers deployed with Runpod Flash — the `runpod.apps` SDK and `rp flash` CLI built into
+[runpod-python](https://github.com/runpod/runpod-python) 2.1+. It measures the whole AI
 task: getting the weights, loading them to the GPU, and generating text. Anyone with a Runpod
 account can reproduce the numbers below with two commands:
 
@@ -94,6 +95,29 @@ Full reports: [`results/qwen3b-gs/report.md`](results/qwen3b-gs/report.md) ·
 the same day ([`results/qwen3b`](results/qwen3b/report.md),
 [`results/qwen7b`](results/qwen7b/report.md)) agree with them.
 
+### Re-run on runpod 2.1.0 (2026-11-03)
+
+The tables above were measured with `runpod-flash` 1.20 and a vendored VolumeCache from runpod 1.12.
+After moving the harness to the Flash built into runpod 2.1.0, a smaller 3B run (3 cold trials,
+5 strategies, RTX 4090, `EU-RO-1`; [`results/qwen3b-rp21`](results/qwen3b-rp21/report.md)) gave
+these median storage times (acquire + load):
+
+| strategy | 2026-09-25 (Flash 1.20, VolumeCache 1.12) | 2026-11-03 (runpod 2.1.0) |
+|---|---|---|
+| `nocache` | 14.7s | 12.0s |
+| `volume` | 16.3s | 21.2s |
+| `volumecache` | **6.7s** (4.7 + 1.3) | 23.1s (17.8 hydrate + 4.2 load) |
+| `globalstore` | 48.1s | 36.6s |
+| `gshydrate` | – | **15.0s** (10.5 + 4.3) |
+
+**VolumeCache no longer beats loading in place on a network volume, because of its new hydrate
+defaults.** 2.1.0's VolumeCache hydrates with 64 concurrent 8 MiB range reads, tuned for Global
+Store. On a network volume that ran at ~340–375 MiB/s. On the same worker and mirror, with the page
+cache evicted before each try, `hydrate_workers=8, hydrate_chunk_size=64 MiB` ran at ~1000 MiB/s
+(5.9s vs 15.8–17.3s, 2 repetitions each); one worker × 1 GiB ran at ~360 MiB/s and a plain sequential
+`copyfile` at ~460 MiB/s. That is an SDK default to fix upstream; the harness measures stock VolumeCache
+and doesn't tune it.
+
 ---
 
 ## Reproduce it yourself
@@ -114,8 +138,8 @@ the same day ([`results/qwen3b`](results/qwen3b/report.md),
 git clone https://github.com/deanq/flash-model-cache-bench.git
 cd flash-model-cache-bench
 
-make setup            # uv sync (pins runpod-flash 1.20.0), creates .env, checks for an API key
-$EDITOR .env          # set RUNPOD_API_KEY=...   (or run: uv run flash login)
+make setup            # uv sync (pins runpod 2.1.0), creates .env, checks for an API key
+$EDITOR .env          # set RUNPOD_API_KEY=...   (or run: uv run rp login)
 
 make run              # report written to runs/<run-id>/report.md
 ```
@@ -152,10 +176,10 @@ Set them in `.env` or on the command line (`make run MODEL=... COLD_TRIALS=5`).
 | variable | default | notes |
 |---|---|---|
 | `MODEL` | `Qwen/Qwen2.5-3B-Instruct` | any HF causal LM that fits the GPU in bf16 |
-| `GPU` | `ADA_24` | Flash `GpuGroup`/`GpuType` name(s), comma-separated (e.g. `AMPERE_48`) |
+| `GPU` | `ADA_24` | `runpod.GpuGroup`/`GpuType` name(s) or shorthands, comma-separated (e.g. `AMPERE_48`, `4090`) |
 | `DATACENTER` | `EU-RO-1` | must support network volumes |
 | `VOLUME_GB` | `50` | needs ≈ 2.2 × model size (volume copy + VolumeCache mirror) |
-| `STRATEGIES` | all six | comma-separated subset of `nocache,volume,volumecache,modelstore,globalstore,gsvolumecache` |
+| `STRATEGIES` | all seven | comma-separated subset of `nocache,volume,volumecache,modelstore,globalstore,gsvolumecache,gshydrate`; only these are deployed |
 | `COLD_TRIALS` | `3` | forced-cold requests per strategy |
 | `WARM_PER_COLD` | `2` | warm requests after each cold one |
 | `MAX_NEW_TOKENS` | `128` | exact number of tokens generated per request |
@@ -163,6 +187,7 @@ Set them in `.env` or on the command line (`make run MODEL=... COLD_TRIALS=5`).
 | `EVICT_PAGE_CACHE` | `1` | drop the kernel page cache for files read from shared storage before reading them |
 | `HF_TOKEN` | – | gated/private models only |
 | `KEEP` | `0` | `1` skips teardown for debugging — run `make clean` afterwards |
+| `RUN_ID` | timestamp | names the run's app, network volume and global volume (`hfbench-<RUN_ID>`) |
 
 ### Reading the report
 
@@ -187,9 +212,9 @@ and copy errors.
 
 ## How it works
 
-### The six strategies
+### The seven strategies
 
-All six are queue-based GPU endpoints running **the same handler code** on the same GPU class in
+All seven are queue-based GPU endpoints running **the same handler code** on the same GPU class in
 the same datacenter. Only where the model bytes come from differs.
 
 | strategy | on a cold start |
@@ -199,37 +224,42 @@ the same datacenter. Only where the model bytes come from differs.
 | `volumecache` | HF cache on container disk; [`VolumeCache`](https://github.com/runpod/runpod-python) `hydrate()`s it from a mirror on the network volume, then it loads locally |
 | `modelstore` | Runpod [cached model](https://docs.runpod.io/serverless/endpoints/model-caching), staged by the platform at `/runpod-volume/huggingface-cache/hub` |
 | `globalstore` | a [global volume](https://docs.runpod.io/storage/globalvolume/globalvolume-serverless) mounted at `/runpod-volume`; the model is loaded straight from a plain folder of files on it |
-| `gsvolumecache` | like `volumecache`, but the mirror lives on the global volume (with the `copyfile` patch) |
+| `gsvolumecache` | like `volumecache`, but the mirror lives on the global volume |
+| `gshydrate` | the `globalstore` folder, copied to container disk with 64 concurrent 8 MiB range reads, then loaded locally |
 
 A global volume and a network volume can't be attached to the same endpoint, so the
 Global Store strategies get their own endpoints. Global volumes don't tie an endpoint to a
-datacenter, but here they are pinned to `DATACENTER` like the rest, so all six are comparable.
+datacenter, but here they are pinned to `DATACENTER` like the rest, so all of them are comparable.
 
 Each request then loads the tokenizer and model (`AutoModelForCausalLM`, bf16, `device_map="cuda"`)
 and greedily generates exactly `MAX_NEW_TOKENS` tokens.
 
 ### A run, step by step
 
-1. **Preflight**: API key present; no leftover `hf-cache-bench` app from an earlier run.
-2. **Create a Global Store** `hfbench-<id>`, if any Global Store strategy is selected.
-3. **Deploy**: `flash deploy --app hf-cache-bench --env run-<id>` creates the endpoints and a
-   network volume `hfbench-<id>`, attached to `volume` and `volumecache`.
-4. **Attach what Flash can't**:
-   - Sets `modelReferences` on `modelstore`.
-   - Attaches the Global Store to `globalstore` and `gsvolumecache`.
-5. **Prime**: one request per strategy fills its cache. Reported separately.
-6. **Rounds** (`COLD_TRIALS` of them):
+1. **Preflight**: API key present; no app `hfbench-<id>` exists yet.
+2. **Deploy**: `rp flash deploy --env run-<id>` in `worker/` creates app `hfbench-<id>` with one
+   endpoint per selected strategy. Storage is declared in `worker/bench_app.py` and created by
+   the deploy: a `NetworkVolume` `hfbench-<id>` for `volume`/`volumecache`, a `GlobalVolume`
+   `hfbench-<id>` for the Global Store strategies, and `model=runpod.Model(MODEL)`
+   (`modelReferences`) on `modelstore`. Every run is its own app, so teardown can't touch anything
+   else in the account.
+3. **Verify attachments**: reads each endpoint back and fails the run if the cached model or the
+   global volume is missing.
+4. **Prime**: one request per strategy fills its cache. Reported separately.
+5. **Rounds** (`COLD_TRIALS` of them):
    - Every endpoint is paused (`workersMax=0`) until `/health` reports zero workers, then
      restored, so the next request is guaranteed to hit a fresh worker.
    - Each strategy then gets 1 cold request and `WARM_PER_COLD` warm ones.
-   - Strategies that share storage (`volume`/`volumecache`, `globalstore`/`gsvolumecache`) run
-     in different waves, so they never compete for bandwidth.
-7. **Report**: `runs/<id>/report.md` and `summary.json`.
-8. **Teardown** (always):
-   - `flash app delete` removes the endpoints.
-   - The network volume and the Global Store are deleted separately, because Flash leaves them behind.
-   - A check confirms that no `hfbench-*` endpoint, run volume or run Global Store remains. If
-     anything is left, the run exits non-zero and says what; `make clean` retries the teardown.
+   - Strategies that share storage (`volume`/`volumecache`, `globalstore`/`gsvolumecache`/`gshydrate`)
+     run in different waves, so they never compete for bandwidth.
+6. **Report**: `runs/<id>/report.md` and `summary.json`.
+7. **Teardown** (always):
+   - `rp flash app delete hfbench-<id> --yes` removes the endpoints and the app.
+   - The network volume and the global volume are deleted separately, because `rp flash app delete`
+     leaves them behind.
+   - A check confirms that the app, the run's endpoint ids, its network volume and its global volume
+     are gone. If anything is left, the run exits non-zero and says what; `make clean` retries the
+     teardown.
 
 ### Measurement choices, and why
 
@@ -239,11 +269,12 @@ and greedily generates exactly `MAX_NEW_TOKENS` tokens.
   an already-loaded process is marked invalid and retried.
 - **The benchmark's own pause window is excluded.** After `workersMax` is restored, the endpoint
   answers `409 ENDPOINT_PAUSED` for a few seconds. The clock starts when the job is accepted.
-- **Settings Flash doesn't manage are carried through every update.** Endpoint updates resend
-  the whole config, so each one re-sends `modelReferences` and the attached global volume; a
-  `workersMax` toggle can't silently detach them.
-- **Local caches live outside `/root/.cache`.** flash-worker tars new files under `/root/.cache`
-  onto an attached volume, which would silently turn every strategy into a storage-backed one.
+- **`workersMax` is toggled with a partial update.** The harness PATCHes only the `workers` block
+  (REST v2, as `rp endpoint scale` does), so a toggle can't detach `modelReferences`, the volume or
+  the Flash environment binding.
+- **Local caches live outside `/root/.cache`.** The Flash 1.x worker tarred new files under
+  `/root/.cache` onto an attached volume, which would silently turn every strategy into a
+  storage-backed one.
 - **Leftover local files are wiped on each cold process.** FlashBoot can restart the same worker
   with its container disk intact. `nocache` and the VolumeCache strategies delete leftovers first
   (and record how many bytes were there).
@@ -254,38 +285,42 @@ and greedily generates exactly `MAX_NEW_TOKENS` tokens.
   (MooseFS client, geesefs).
 - **Medians instead of means.** Worker placement produces outliers (18-minute waits next to 10s
   ones) that pull a mean far from the typical case.
-- **VolumeCache is vendored** from runpod-python 1.12.0 (`worker/vendor/rp_volume_cache.py`,
-  MIT). Flash's worker images are built from a lockfile that still pins runpod 1.10.1, which
-  predates `VolumeCache`. The SDK's own class is used automatically once a Flash release includes
-  it; `notes.impl` records which one ran.
+- **VolumeCache is the SDK's own.** `rp flash deploy` vendors the deploying client's runpod package
+  into the build artifact, so workers run the same runpod (2.1.0) as your machine; `notes.impl`
+  records the version. 2.1.0's VolumeCache hydrates big files with concurrent range reads (64 × 8 MiB
+  by default) and treats file metadata as best-effort, so it no longer drops files on Global Store.
 
 ### Gaps found while building this
 
-- **No API support for Model Store:** there is no `Endpoint` parameter, and the REST API doesn't
-  expose it either. `bench/runpod_api.py` sets `modelReferences` with the same GraphQL
-  `saveEndpoint` mutation the console uses (the API stores it as
-  `https://huggingface.co/<Org>/<Name>:<commit>`).
-- **No working API for Global Store:** Flash has no parameter for it, and the documented
-  REST v2 `globalVolumes` field is rejected (`additional properties 'globalVolumes' not allowed`).
-  The harness uses the console's GraphQL calls instead:
-  - `globalStoreBucketCreate` / `globalStoreBucketDelete` to create and delete it;
-  - `saveEndpoint` with `volumes: [{volumeId, volumeType: OBJECT_STORE_VOLUME}]` to attach it.
-- **VolumeCache on Global Store fails silently** (finding 4). That is a runpod-python bug worth
-  filing: `_copy_file` should use `copyfile` and treat metadata as best-effort, and copy
-  failures shouldn't be logged only at debug level.
-- **`execution_timeout_ms` passed to `Endpoint` was not applied;** the deployed endpoint kept `0`.
-- **`flash build` reads `dependencies=[...]` from the source code itself,** so the list must be
-  written out literally in each `Endpoint(...)` call.
-- **`flash app delete` does not delete network volumes** its endpoints created.
-- **Stale `.flash/resources.pkl` state breaks the next deploy** ("Endpoint not found") after the
-  endpoints are deleted, so each run clears it first.
-- **Flash endpoints put your `RUNPOD_API_KEY` in the endpoint's environment,** where anyone who can
-  read the endpoint config can see it. The harness never prints endpoint env.
+Status with runpod 2.1.0 (the harness was first built on standalone `runpod-flash` 1.20):
+
+- **Model Store and Global Store are now first-class.** `model=runpod.Model(...)` sets
+  `modelReferences`, and `mounts={"/runpod-volume": runpod.GlobalVolume(name)}` creates and attaches
+  a global volume. The console GraphQL calls this harness needed with Flash 1.20 are gone.
+- **`execution_timeout_ms` is applied** to the deployed endpoint (Flash 1.20 left it at `0`).
+- **`dependencies=[...]` no longer has to be a literal.** The build reads it from the imported
+  spec, not the source AST, so the decorator config is built by a function.
+- **No local deploy state.** Deployed resources resolve server-side, so the Flash 1.20 problem of
+  a stale `.flash/resources.pkl` breaking the next deploy is gone.
+- **VolumeCache on Global Store no longer needs a patch.** The SDK now copies with `copyfile` and
+  treats metadata as best-effort (unit-tested here), so the `copyfile` patch (finding 4) and the
+  vendored copy are gone. `gsvolumecache` has not been re-measured live on 2.1.0 yet.
+- **`rp flash app delete` still does not delete volumes** — neither the network volume nor the
+  global volume its endpoints created.
+- **The `409 ENDPOINT_PAUSED` window remains** after `workersMax` goes 0 → 1 (up to ~9s on
+  2026-11-03); `bench/runpod_api.py` retries through it, and the clock starts when the job is accepted.
+- **`runpod.__version__` on a worker reports the image's runpod (2.0.0), not the code that runs.**
+  The artifact overlays the client's 2.1.0 package tree without its dist metadata, and `__version__`
+  reads the metadata. The harness records `runpod._version` as `versions.runpod_code`.
+- **VolumeCache's default hydrate (64 × 8 MiB ranges) is ~3× slower than 8 × 64 MiB on a network
+  volume.** See "Re-run on runpod 2.1.0" above.
+- **Flash endpoints still put your `RUNPOD_API_KEY` in the endpoint's environment,** where anyone
+  who can read the endpoint config can see it. The harness never prints endpoint env.
 
 ### Troubleshooting
 
-- **`app 'hf-cache-bench' already exists`**: a previous run didn't finish its teardown. Run
-  `make clean`.
+- **`app 'hfbench-<id>' already exists`**: that `RUN_ID` was used before. Pick another one, or run
+  `make clean` if that run didn't finish its teardown.
 - **Global Store creation fails** (e.g. beta not enabled): run without it,
   `make run STRATEGIES=nocache,volume,volumecache,modelstore`.
 - **A strategy fails in the prime phase**: it is excluded from the rounds, and the error is shown
@@ -300,17 +335,16 @@ and greedily generates exactly `MAX_NEW_TOKENS` tokens.
 ## Layout
 
 ```
-worker/                 Flash deploy root (becomes the worker's /app)
-  bench_app.py          the six @Endpoint definitions
+worker/                 `rp flash deploy` root (the build artifact's source)
+  bench_app.py          runpod.App with one @app.queue endpoint per selected strategy, plus its storage
   runtime.py            request handling: cold load vs warm, timings, provenance
-  strategies.py         the six acquisition strategies + Global Store VolumeCache patch (unit-tested)
-  vendor/               VolumeCache from runpod-python 1.12.0 (MIT)
+  strategies.py         the seven acquisition strategies (unit-tested)
 bench/                  orchestrator (runs on your machine)
   __main__.py           run / report / clean / preflight
   config.py             env-var config, validated before anything is deployed
-  deploy.py             flash CLI deploy/teardown, Global Store lifecycle, state file for recovery
+  deploy.py             rp flash deploy/teardown, attachment checks, volume cleanup, state file for recovery
   driver.py             prime, forced-cold rounds in shared-storage waves, warm follow-ups
-  runpod_api.py         job/health API; GraphQL for modelReferences, workersMax, Global Store; volumes
+  runpod_api.py         job/health API; workersMax (REST v2 PATCH); app/env lookup; volume cleanup
   report.py             results.jsonl -> report.md
 results/                the published runs (report, raw trials, summary, config)
 tests/                  `make test` — no network, no spend
@@ -318,5 +352,4 @@ tests/                  `make test` — no network, no spend
 
 ## License
 
-MIT (see [`LICENSE`](LICENSE)). `worker/vendor/rp_volume_cache.py` is © Runpod, MIT, see
-[`worker/vendor/LICENSE.runpod-python`](worker/vendor/LICENSE.runpod-python).
+MIT (see [`LICENSE`](LICENSE)).

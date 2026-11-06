@@ -7,12 +7,14 @@ import re
 import time
 from dataclasses import asdict, dataclass
 
-APP_NAME = "hf-cache-bench"
+RESOURCE_PREFIX = "hfbench-"   # app, network volume and global store names: hfbench-<run id>
 STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate")
 GLOBAL_STORE_STRATEGIES = ("globalstore", "gsvolumecache", "gshydrate")
+NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache")
 DATACENTERS = ("US-CA-2", "US-IL-1", "US-KS-2", "US-MO-1", "US-MO-2", "US-NC-2", "US-NE-1", "US-WA-1",
-               "EU-CZ-1", "EU-RO-1", "EUR-NO-1")   # runpod_flash.DataCenter (network-volume capable)
+               "EU-CZ-1", "EU-RO-1", "EUR-NO-1")   # runpod.DataCenter (network-volume capable)
 _REPO_ID = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,39}$")   # becomes app, volume and path names
 
 
 class ConfigError(ValueError):
@@ -37,16 +39,26 @@ class Config:
     keep: bool                   # skip teardown (debugging only)
 
     @property
+    def app_name(self) -> str:
+        """One Flash app per run, so teardown (`rp flash app delete`) can only ever
+        touch this run's endpoints, even with other deployments in the account."""
+        return f"{RESOURCE_PREFIX}{self.run_id}"
+
+    @property
     def env_name(self) -> str:
         return f"run-{self.run_id}"
 
     @property
     def volume_name(self) -> str:
-        return f"hfbench-{self.run_id}"
+        return f"{RESOURCE_PREFIX}{self.run_id}"
 
     @property
     def global_store_name(self) -> str:
-        return f"hfbench-{self.run_id}"
+        return f"{RESOURCE_PREFIX}{self.run_id}"
+
+    @property
+    def uses_network_volume(self) -> bool:
+        return any(s in NETWORK_VOLUME_STRATEGIES for s in self.strategies)
 
     @property
     def uses_global_store(self) -> bool:
@@ -57,11 +69,11 @@ class Config:
         return os.path.join("runs", self.run_id)
 
     def deploy_env(self) -> dict[str, str]:
-        """BENCH_* variables read by worker/bench_app.py at `flash deploy` time."""
-        env = {"BENCH_RUN_ID": self.run_id, "BENCH_MODEL": self.model, "BENCH_GPU": self.gpu,
-               "BENCH_DC": self.datacenter, "BENCH_VOLUME_NAME": self.volume_name,
-               "BENCH_VOLUME_GB": str(self.volume_gb), "BENCH_EVICT": "1" if self.evict_page_cache else "0"}
-        return env
+        """BENCH_* variables read by worker/bench_app.py at `rp flash deploy` time."""
+        return {"BENCH_RUN_ID": self.run_id, "BENCH_APP": self.app_name, "BENCH_MODEL": self.model,
+                "BENCH_GPU": self.gpu, "BENCH_DC": self.datacenter, "BENCH_STRATEGIES": ",".join(self.strategies),
+                "BENCH_VOLUME_NAME": self.volume_name, "BENCH_GLOBAL_STORE_NAME": self.global_store_name,
+                "BENCH_VOLUME_GB": str(self.volume_gb), "BENCH_EVICT": "1" if self.evict_page_cache else "0"}
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -106,8 +118,11 @@ def load(env=None, *, run_id: str | None = None) -> Config:
     unknown = [s for s in strategies if s not in STRATEGIES]
     if unknown or not strategies:
         raise ConfigError(f"STRATEGIES has unknown/empty entries {unknown}; choose from {STRATEGIES}")
+    run_id = run_id or env.get("RUN_ID") or time.strftime("%Y%m%d-%H%M%S")
+    if not _RUN_ID.match(run_id):
+        raise ConfigError(f"RUN_ID={run_id!r} must be 1-40 letters, digits or '-' (it names the app and volumes)")
     return Config(
-        run_id=run_id or env.get("RUN_ID") or time.strftime("%Y%m%d-%H%M%S"),
+        run_id=run_id,
         model=model,
         gpu=_str(env, "GPU", "ADA_24"),
         datacenter=dc,

@@ -1,7 +1,7 @@
 """CLI: python -m bench {preflight,run,report,clean}
 
-`run` is the whole pipeline: preflight -> deploy -> attach cached model -> prime
--> cold/warm rounds -> report -> teardown. Teardown runs in `finally` (and on
+`run` is the whole pipeline: preflight -> deploy (`rp flash deploy`) -> verify
+attachments -> prime -> cold/warm rounds -> report -> teardown. Teardown runs in `finally` (and on
 SIGTERM), so a failed or interrupted run still deletes what it created.
 """
 from __future__ import annotations
@@ -21,12 +21,11 @@ from bench.driver import Driver, Recorder
 from bench.runpod_api import Runpod, RunpodError, api_key
 
 
-def preflight(rp: Runpod) -> None:
+def preflight(cfg: config_mod.Config, rp: Runpod) -> None:
     api_key()
-    res = deploy._flash(["app", "get", config_mod.APP_NAME], check=False, quiet=True)
-    if res.returncode == 0:
-        raise SystemExit(f"app {config_mod.APP_NAME!r} already exists — another run is in progress or a "
-                         f"previous one was not cleaned up. Run `make clean` first.")
+    if rp.flash_app_exists(cfg.app_name):
+        raise SystemExit(f"app {cfg.app_name!r} already exists — RUN_ID={cfg.run_id!r} was used before. "
+                         f"Pick another RUN_ID, or run `make clean` if that run was not torn down.")
     dirty = [p for p in glob.glob("runs/*/state.json") if not json.load(open(p)).get("torn_down")]
     if dirty:
         deploy.log(f"warning: runs with unfinished teardown: {dirty} (`make clean` retries them)")
@@ -36,7 +35,7 @@ def preflight(rp: Runpod) -> None:
 def cmd_run(args) -> int:
     cfg = config_mod.load()
     rp = Runpod()
-    preflight(rp)
+    preflight(cfg, rp)
     os.makedirs(cfg.run_dir, exist_ok=True)
     meta = {**cfg.to_dict(), "started_at": time.time()}
     _write_json(os.path.join(cfg.run_dir, "meta.json"), meta)
@@ -46,10 +45,8 @@ def cmd_run(args) -> int:
     try:
         state = deploy.deploy(cfg, rp)
         meta["endpoints"] = state.endpoints
-        meta["model_reference"] = deploy.attach_cached_model(cfg, state, rp) if "modelstore" in cfg.strategies else None
-        if cfg.uses_global_store:
-            deploy.attach_global_store(cfg, state, rp)
-            meta["global_store_id"] = state.global_store_id
+        meta["app"], meta["volume_id"], meta["global_store_id"] = state.app, state.volume_id, state.global_store_id
+        meta["attachments"] = deploy.verify_attachments(cfg, state, rp)
         _write_json(os.path.join(cfg.run_dir, "meta.json"), meta)
         driver = Driver(cfg, rp, state.endpoints, Recorder(os.path.join(cfg.run_dir, "results.jsonl")))
         primed = driver.prime()
@@ -81,13 +78,14 @@ def _finish(cfg, rp: Runpod, state, exit_code: int) -> int:
                    "and the volume bills per GB-month.")
         return exit_code
     state = state or _load_state(cfg.run_id) or deploy.State(
-        cfg.run_id, config_mod.APP_NAME, cfg.env_name, cfg.volume_name,
+        cfg.run_id, cfg.app_name, cfg.env_name, cfg.volume_name,
         global_store_name=cfg.global_store_name if cfg.uses_global_store else "")
     leftovers = deploy.teardown(state, rp)
     if leftovers:
         deploy.log(f"TEARDOWN INCOMPLETE — still present: {leftovers}. Re-run `make clean`.")
         return exit_code or 2
-    deploy.log("teardown verified: no endpoints, network volume or global store left")
+    deploy.log(f"teardown verified: app {state.app}, endpoints {sorted(state.endpoints.values())}, "
+               f"network volume {state.volume_id}, global volume {state.global_store_id} are gone")
     return exit_code
 
 
@@ -106,10 +104,13 @@ def cmd_report(args) -> int:
 
 
 def cmd_clean(args) -> int:
-    """Tear down every run whose state says it is not torn down, plus the app itself."""
+    """Tear down every run whose state says it is not torn down. State is written before
+    anything is created, so every run that may have left resources has one."""
     rp = Runpod()
     states = [deploy.State.load(os.path.basename(os.path.dirname(p))) for p in glob.glob("runs/*/state.json")]
-    pending = [s for s in states if not s.torn_down] or [deploy.State("adhoc", config_mod.APP_NAME, "", "")]
+    pending = [s for s in states if not s.torn_down]
+    if not pending:
+        deploy.log("nothing to clean: every run in runs/ is torn down")
     code = 0
     for s in pending:
         left = deploy.teardown(s, rp)
@@ -119,8 +120,7 @@ def cmd_clean(args) -> int:
 
 
 def cmd_preflight(args) -> int:
-    config_mod.load()
-    preflight(Runpod())
+    preflight(config_mod.load(), Runpod())
     return 0
 
 
