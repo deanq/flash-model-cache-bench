@@ -179,8 +179,24 @@ class Driver:
             self.rec.add(w)
 
     def rounds(self, strategies: list[str]) -> None:
+        """cold_trials rounds, then up to makeup_rounds more for the strategies still short
+        of cold_trials valid cold trials (e.g. no worker within the trial timeout)."""
         for rnd in range(1, self.cfg.cold_trials + 1):
             log(f"round {rnd}/{self.cfg.cold_trials}: forcing scale-to-zero on {strategies}")
-            force_cold(self.rp, [self.endpoints[s] for s in strategies])
-            for wave in (waves(strategies) if self.cfg.parallel else [strategies]):
-                self._each(wave, lambda s: self._cold_then_warm(s, rnd))
+            self._round(strategies, rnd)
+        for extra in range(1, self.cfg.makeup_rounds + 1):
+            short = [s for s in strategies if self._valid_cold(s) < self.cfg.cold_trials]
+            if not short:
+                return
+            rnd = self.cfg.cold_trials + extra
+            log(f"make-up round {extra}/{self.cfg.makeup_rounds} (r{rnd}): {short} short of "
+                f"{self.cfg.cold_trials} valid cold trials")
+            self._round(short, rnd)
+
+    def _round(self, strategies: list[str], rnd: int) -> None:
+        force_cold(self.rp, [self.endpoints[s] for s in strategies])
+        for wave in (waves(strategies) if self.cfg.parallel else [strategies]):
+            self._each(wave, lambda s: self._cold_then_warm(s, rnd))
+
+    def _valid_cold(self, strategy: str) -> int:
+        return sum(1 for t in self.rec.trials if t.strategy == strategy and t.phase == "cold" and t.valid)

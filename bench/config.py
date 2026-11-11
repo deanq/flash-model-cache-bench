@@ -31,6 +31,7 @@ class Config:
     volume_gb: int
     strategies: tuple[str, ...]
     cold_trials: int
+    makeup_rounds: int           # extra rounds for strategies short of cold_trials valid trials
     warm_per_cold: int
     max_new_tokens: int
     parallel: bool
@@ -130,6 +131,7 @@ def load(env=None, *, run_id: str | None = None) -> Config:
         volume_gb=_int(env, "VOLUME_GB", 50, 10, 4000),
         strategies=strategies,
         cold_trials=_int(env, "COLD_TRIALS", 3, 1, 50),
+        makeup_rounds=_int(env, "MAKEUP_ROUNDS", 3, 0, 50),
         warm_per_cold=_int(env, "WARM_PER_COLD", 2, 0, 50),
         max_new_tokens=_int(env, "MAX_NEW_TOKENS", 128, 1, 4096),
         parallel=_bool(env, "PARALLEL", True),

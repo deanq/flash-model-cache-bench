@@ -435,3 +435,33 @@ def test_status_polls_survive_transient_connection_resets(monkeypatch):
         lambda r: (_ for _ in ()).throw(httpx.ConnectError("unreachable")))))
     with pytest.raises(RunpodError, match="health of e: ConnectError"):
         down.health("e")
+
+
+def _makeup_driver(tmp_path, monkeypatch, jobs, makeup="2"):
+    monkeypatch.setattr(driver, "POLL_S", 0)
+    monkeypatch.setattr(driver.time, "sleep", lambda s: None)
+    cfg = config.load({"COLD_TRIALS": "2", "WARM_PER_COLD": "0", "STRATEGIES": "nocache,volume",
+                       "PARALLEL": "0", "MAKEUP_ROUNDS": makeup}, run_id="r")
+    rp = FakeRp()
+    rp.jobs.update(jobs)
+    rec = driver.Recorder(str(tmp_path / "r.jsonl"))
+    driver.Driver(cfg, rp, {"nocache": "a", "volume": "b"}, rec).rounds(["nocache", "volume"])
+    return rec
+
+
+def test_makeup_rounds_top_up_only_strategies_short_of_valid_cold_trials(tmp_path, monkeypatch):
+    """A capacity timeout costs a trial the strategy didn't lose; re-run only the short ones."""
+    timeout = {"status": "FAILED", "error": "no worker"}
+    rec = _makeup_driver(tmp_path, monkeypatch, {
+        "a": [completed({"cold_process": True})] * 2,
+        "b": [timeout, completed({"cold_process": True}), completed({"cold_process": True})]})
+    cold = [(t.strategy, t.round, t.valid) for t in rec.trials if t.phase == "cold"]
+    assert cold == [("nocache", 1, True), ("volume", 1, False), ("nocache", 2, True), ("volume", 2, True),
+                    ("volume", 3, True)]
+
+
+def test_makeup_rounds_are_capped(tmp_path, monkeypatch):
+    timeout = {"status": "FAILED", "error": "no worker"}
+    rec = _makeup_driver(tmp_path, monkeypatch, {"a": [completed({"cold_process": True})] * 2,
+                                                 "b": [timeout] * 10}, makeup="1")
+    assert [t.round for t in rec.trials if t.strategy == "volume"] == [1, 2, 3]

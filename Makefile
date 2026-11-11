@@ -18,7 +18,7 @@ ifneq (,$(wildcard .env))
 include .env
 export $(shell sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' .env)
 endif
-export MODEL GPU DATACENTER VOLUME_GB STRATEGIES COLD_TRIALS WARM_PER_COLD MAX_NEW_TOKENS PARALLEL EVICT_PAGE_CACHE KEEP RUN_ID
+export MODEL GPU DATACENTER VOLUME_GB STRATEGIES COLD_TRIALS MAKEUP_ROUNDS WARM_PER_COLD MAX_NEW_TOKENS PARALLEL EVICT_PAGE_CACHE KEEP RUN_ID
 
 help:
 	@sed -n '3,10p' Makefile | sed 's/^# \{0,1\}//'

@@ -182,6 +182,7 @@ Set them in `.env` or on the command line (`make run MODEL=... COLD_TRIALS=5`).
 | `VOLUME_GB` | `50` | needs ≈ 2.2 × model size (volume copy + VolumeCache mirror) |
 | `STRATEGIES` | all eight | comma-separated subset of `nocache,volume,volumecache,modelstore,globalstore,gsvolumecache,gshydrate,volumeprefetch`; only these are deployed |
 | `COLD_TRIALS` | `3` | forced-cold requests per strategy |
+| `MAKEUP_ROUNDS` | `3` | extra rounds, only for strategies short of `COLD_TRIALS` valid cold trials (e.g. no worker within the trial timeout) |
 | `WARM_PER_COLD` | `2` | warm requests after each cold one |
 | `MAX_NEW_TOKENS` | `128` | exact number of tokens generated per request |
 | `PARALLEL` | `1` | strategies run concurrently within a round (in waves, see below); `0` = one at a time |
