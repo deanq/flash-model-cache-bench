@@ -2,7 +2,7 @@
 
 **What is the fastest way to get a Hugging Face model onto a Runpod Serverless GPU on a cold start?**
 
-This repo benchmarks seven model-storage strategies side by side on real Runpod Serverless GPU
+This repo benchmarks eight model-storage strategies side by side on real Runpod Serverless GPU
 workers deployed with Runpod Flash — the `runpod.apps` SDK and `rp flash` CLI built into
 [runpod-python](https://github.com/runpod/runpod-python) 2.1+. It measures the whole AI
 task: getting the weights, loading them to the GPU, and generating text. Anyone with a Runpod
@@ -138,7 +138,7 @@ and doesn't tune it.
 git clone https://github.com/deanq/flash-model-cache-bench.git
 cd flash-model-cache-bench
 
-make setup            # uv sync (pins runpod 2.1.0), creates .env, checks for an API key
+make setup            # uv sync (pins runpod 2.2.1), creates .env, checks for an API key
 $EDITOR .env          # set RUNPOD_API_KEY=...   (or run: uv run rp login)
 
 make run              # report written to runs/<run-id>/report.md
@@ -156,6 +156,7 @@ Other targets:
 | command | what it does |
 |---|---|
 | `make report [RUN=<id>]` | re-render a report from `runs/<id>/results.jsonl` |
+| `make billing [RUN=<id>]` | fetch Runpod-billed GPU-minutes and cost for a finished run (billing lags ~1 h); adds "Time and cost" to the report |
 | `make clean` | tear down anything a crashed or interrupted run left behind (safe to run any time) |
 | `make test` | unit tests — no network, no spend |
 
@@ -179,7 +180,7 @@ Set them in `.env` or on the command line (`make run MODEL=... COLD_TRIALS=5`).
 | `GPU` | `ADA_24` | `runpod.GpuGroup`/`GpuType` name(s) or shorthands, comma-separated (e.g. `AMPERE_48`, `4090`) |
 | `DATACENTER` | `EU-RO-1` | must support network volumes |
 | `VOLUME_GB` | `50` | needs ≈ 2.2 × model size (volume copy + VolumeCache mirror) |
-| `STRATEGIES` | all seven | comma-separated subset of `nocache,volume,volumecache,modelstore,globalstore,gsvolumecache,gshydrate`; only these are deployed |
+| `STRATEGIES` | all eight | comma-separated subset of `nocache,volume,volumecache,modelstore,globalstore,gsvolumecache,gshydrate,volumeprefetch`; only these are deployed |
 | `COLD_TRIALS` | `3` | forced-cold requests per strategy |
 | `WARM_PER_COLD` | `2` | warm requests after each cold one |
 | `MAX_NEW_TOKENS` | `128` | exact number of tokens generated per request |

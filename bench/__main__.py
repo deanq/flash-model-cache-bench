@@ -1,4 +1,4 @@
-"""CLI: python -m bench {preflight,run,report,clean}
+"""CLI: python -m bench {preflight,run,report,billing,clean}
 
 `run` is the whole pipeline: preflight -> deploy (`rp flash deploy`) -> verify
 attachments -> prime -> cold/warm rounds -> report -> teardown. Teardown runs in `finally` (and on
@@ -103,6 +103,20 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_billing(args) -> int:
+    """Fetch Runpod-billed GPU time and cost for a finished run into billing.json and
+    re-render its report. Run it ~1 h after the run: billing rows lag usage."""
+    run_dir = os.path.join("runs", args.run_id or _latest_run())
+    with open(os.path.join(run_dir, "meta.json")) as fh:
+        meta = json.load(fh)
+    if not meta.get("finished_at"):
+        raise SystemExit(f"{run_dir} has not finished; nothing to bill yet")
+    rows = Runpod().endpoint_billing(start=meta["started_at"], end=meta["finished_at"])
+    _write_json(os.path.join(run_dir, "billing.json"), rows)
+    print(open(report.write(run_dir)).read())
+    return 0
+
+
 def cmd_clean(args) -> int:
     """Tear down every run whose state says it is not torn down. State is written before
     anything is created, so every run that may have left resources has one."""
@@ -145,6 +159,9 @@ def main(argv=None) -> int:
     r = sub.add_parser("report")
     r.add_argument("run_id", nargs="?")
     r.set_defaults(fn=cmd_report)
+    b = sub.add_parser("billing")
+    b.add_argument("run_id", nargs="?")
+    b.set_defaults(fn=cmd_billing)
     args = p.parse_args(argv)
     try:
         return args.fn(args)

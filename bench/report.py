@@ -17,13 +17,18 @@ LABELS = {
     "globalstore": "Runpod Global Store (global volume), loaded in place",
     "gsvolumecache": "VolumeCache (Global Store -> container disk)",
     "gshydrate": "parallel range hydrate (Global Store -> container disk)",
+    "volumeprefetch": "network volume, parallel page-cache prefetch, loaded in place",
 }
 # (in place, VolumeCache, storage name): the question "is loading straight off
 # shared storage slower than copying it to container disk first?" per backend.
 IN_PLACE_VS_CACHED = (("volume", "volumecache", "network volume"),
+                      ("volumeprefetch", "volumecache", "network volume (prefetched)"),
                       ("globalstore", "gsvolumecache", "Global Store"),
                       ("globalstore", "gshydrate", "Global Store (parallel hydrate)"))
 VOLUMECACHE_STRATEGIES = ("volumecache", "gsvolumecache")
+# Strategies whose model load reads shared storage directly (no up-front copy/prefetch).
+LOAD_READS_SHARED_STORAGE = ("volume", "globalstore", "modelstore")
+MIB = 1024 ** 2
 GIB = 1024 ** 3
 DELAY_OUTLIER_FACTOR = 2.0
 
@@ -76,6 +81,23 @@ def _hub_s(t: dict) -> float | None:
     return sum(parts) if parts else None
 
 
+def _upfront_read_s(t: dict) -> float | None:
+    """Time spent reading shared storage before load: VolumeCache/gshydrate hydrate or prefetch."""
+    return _acq(t, "hydrate_s") if _acq(t, "hydrate_s") is not None else _acq(t, "prefetch_s")
+
+
+def read_mibps(t: dict) -> float | None:
+    """Throughput off shared storage, from the step that reads it: the model load for
+    in-place strategies, the hydrate/prefetch otherwise. None for Hub downloads."""
+    nbytes = _cold(t).get("bytes")
+    secs = _upfront_read_s(t)
+    if secs is None and t["strategy"] in LOAD_READS_SHARED_STORAGE:
+        secs = _cold(t).get("model_load_s")
+    if not nbytes or not secs:
+        return None
+    return nbytes / MIB / secs
+
+
 def storage_s(t: dict) -> float | None:
     """Time the storage strategy is responsible for: getting bytes local + loading them."""
     c = _cold(t)
@@ -100,7 +122,8 @@ def summarize(trials: list[dict], strategies: list[str]) -> dict:
             "cold_exec": stat((t["exec_ms"] or 0) / 1000 for t in cold),
             "import": stat(_cold(t).get("import_s") for t in cold),
             "acquire": stat(_cold(t).get("acquire_s") for t in cold),
-            "hydrate": stat(_acq(t, "hydrate_s") for t in cold),
+            "hydrate": stat(_upfront_read_s(t) for t in cold),
+            "read_mibps": stat(read_mibps(t) for t in cold),
             "hub": stat(_hub_s(t) for t in cold),
             "load": stat((_cold(t).get("tokenizer_load_s") or 0) + (_cold(t).get("model_load_s") or 0)
                          for t in cold),
@@ -179,14 +202,14 @@ def render(meta: dict, trials: list[dict]) -> str:
                   " < ".join(f"{s} {summary[s]['cold_e2e'].median:.1f}s" for s in order), ""]
 
     lines += ["## Cold start (forced scale-to-zero, first request on a new worker)", "",
-              "| strategy | cold request e2e | platform delay | handler exec | import | acquire | ↳ hydrate | ↳ Hub | load (tok+model) | **storage total** | first generate | n |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+              "| strategy | cold request e2e | platform delay | handler exec | import | acquire | ↳ hydrate/prefetch | ↳ Hub | load (tok+model) | **storage total** | shared-storage read | first generate | n |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for s in strategies:
         x = summary[s]
         lines.append(f"| {s} | {x['cold_e2e'].fmt()} | {x['cold_delay'].fmt()} | {x['cold_exec'].fmt()} | "
                      f"{x['import'].fmt()} | {x['acquire'].fmt(digits=2)} | {x['hydrate'].fmt(digits=2)} | "
                      f"{x['hub'].fmt(digits=2)} | {x['load'].fmt(digits=2)} | **{x['storage'].fmt(digits=2)}** | "
-                     f"{x['first_generate'].fmt(digits=2)} | {x['cold_n']}"
+                     f"{x['read_mibps'].fmt(unit=' MiB/s', digits=0)} | {x['first_generate'].fmt(digits=2)} | {x['cold_n']}"
                      + (f" (+{x['cold_invalid']} invalid)" if x["cold_invalid"] else "") + " |")
     lines += ["", "Cells are **median [min–max]** over valid cold trials.", "",
               "- *cold request e2e*: job accepted → result as seen by the client (includes queueing, worker start, "
@@ -195,6 +218,8 @@ def render(meta: dict, trials: list[dict]) -> str:
               "- *platform delay*: Runpod `delayTime` — queue wait + worker start before the handler runs. "
               "Model Store's staging/placement shows up here, not in the handler.",
               "- *storage total* = acquire + tokenizer load + model load: the part of the cold start the strategy controls.",
+              "- *shared-storage read*: model bytes ÷ the step that reads the volume/store — the model load for "
+              "in-place strategies (`volume`, `globalstore`, `modelstore`), the hydrate or prefetch otherwise.",
               ""]
 
     lines += ["## Warm requests (model already in GPU memory)", "",
@@ -267,8 +292,8 @@ def _caveats(meta: dict) -> list[str]:
             "- nocache downloads straight from the Hugging Face CDN; its numbers move with CDN/WAN conditions.",
             "- `GPU` names a class, not a machine: hosts in the same class differ (see the warm tokens/s range), "
             "which shows up in import, load and generate times alike.",
-            ("- Cold rounds ran strategies concurrently in waves; strategies sharing storage (`volume`/`volumecache`, "
-             "`globalstore`/`gsvolumecache`) were never in the same wave. (The prime phase runs all at once.)"
+            ("- Cold rounds ran strategies concurrently in waves; strategies sharing storage (`volume`/`volumecache`/`volumeprefetch`, "
+             "`globalstore`/`gsvolumecache`/`gshydrate`) were never in the same wave. (The prime phase runs all at once.)"
              if meta["parallel"] else "- Strategies ran one at a time (PARALLEL=0)."),
             "- Model Store is declared with `model=runpod.Model(...)` on the endpoint (sets `modelReferences`).",
             *(_GLOBAL_STORE_CAVEATS if any(s in meta["strategies"] for s in ("globalstore", "gsvolumecache", "gshydrate")) else []),
@@ -287,15 +312,59 @@ _GLOBAL_STORE_CAVEATS = [
 ]
 
 
+def usage(meta: dict, trials: list[dict], billing: list[dict] | None) -> dict:
+    """Wall clock, handler time, and (once fetched with `bench billing`) Runpod-billed
+    GPU time and cost. Billing rows are filtered to this run's endpoint ids, so other
+    workloads in the account never leak in."""
+    started, finished = meta.get("started_at"), meta.get("finished_at")
+    out = {"wall_clock_min": (finished - started) / 60 if started and finished else None,
+           "handler_gpu_min": sum((t.get("exec_ms") or 0) for t in trials) / 60000,
+           "billed_gpu_min": None, "billed_usd": None, "billed_gpu_min_by_strategy": None}
+    if billing is None:
+        return out
+    by_id = {eid: s for s, eid in (meta.get("endpoints") or {}).items()}
+    mine = [row for row in billing if row.get("endpointId") in by_id]
+    per: dict[str, float] = {}
+    for row in mine:
+        s = by_id[row["endpointId"]]
+        per[s] = per.get(s, 0.0) + row.get("timeBilledMs", 0) / 60000
+    out.update(billed_gpu_min=sum(per.values()), billed_usd=sum(row.get("amount", 0.0) for row in mine),
+               billed_gpu_min_by_strategy=per)
+    return out
+
+
+def _usage_lines(u: dict) -> list[str]:
+    def num(v, fmt):
+        return "—" if v is None else format(v, fmt)
+    billed = (f"billed GPU time: {num(u['billed_gpu_min'], '.1f')} GPU-min, ${num(u['billed_usd'], '.2f')} "
+              f"(Runpod billing API, this run's endpoints only)" if u["billed_gpu_min"] is not None
+              else "billed GPU time: not fetched yet (`make billing RUN=<id>`; billing lags by up to an hour)")
+    lines = ["## Time and cost", "",
+             f"- wall clock (deploy → teardown): {num(u['wall_clock_min'], '.1f')} min",
+             f"- handler time (sum of `executionTime`): {u['handler_gpu_min']:.1f} GPU-min",
+             f"- {billed}"]
+    if u["billed_gpu_min_by_strategy"]:
+        lines.append("- billed by strategy: " + ", ".join(
+            f"{s} {m:.1f}" for s, m in sorted(u["billed_gpu_min_by_strategy"].items())))
+    return lines + [""]
+
+
+def _read_json(path: str):
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
 def write(run_dir: str) -> str:
-    with open(os.path.join(run_dir, "meta.json")) as fh:
-        meta = json.load(fh)
+    meta = _read_json(os.path.join(run_dir, "meta.json"))
     trials = load_trials(os.path.join(run_dir, "results.jsonl"))
-    md = render(meta, trials)
+    run_usage = usage(meta, trials, _read_json(os.path.join(run_dir, "billing.json")))
+    md = render(meta, trials) + "\n".join(_usage_lines(run_usage))
     path = os.path.join(run_dir, "report.md")
     with open(path, "w") as fh:
         fh.write(md)
-    summary = summarize(trials, meta["strategies"])
+    summary = {"usage": run_usage, "strategies": summarize(trials, meta["strategies"])}
     with open(os.path.join(run_dir, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2, default=lambda o: o.__dict__)
     return path

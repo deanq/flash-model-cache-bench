@@ -28,6 +28,8 @@ SERVERLESS = "https://api.runpod.ai/v2"
 USER_AGENT = "flash-model-cache-bench/0.2"
 TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 PAUSED_POLL_S = 2.0
+READ_ATTEMPTS = 5            # idempotent GETs only; job submission is never retried (no double-submit)
+READ_RETRY_BASE_S = 1.0
 
 
 class RunpodError(RuntimeError):
@@ -68,15 +70,27 @@ class Runpod:
             return r.json()["id"]
 
     def status(self, endpoint_id: str, job_id: str) -> dict:
-        r = self._http.get(f"{SERVERLESS}/{endpoint_id}/status/{job_id}")
+        r = self._read(f"{SERVERLESS}/{endpoint_id}/status/{job_id}", f"status of job {job_id} on {endpoint_id}")
         _raise_for(r, f"status of job {job_id} on {endpoint_id}")
         return r.json()
+
+    def _read(self, url: str, what: str) -> httpx.Response:
+        """GET with retry on transport errors (connection reset, timeout): one network
+        blip during a long poll must not abort the run."""
+        for attempt in range(READ_ATTEMPTS):
+            try:
+                return self._http.get(url)
+            except httpx.TransportError as exc:
+                if attempt == READ_ATTEMPTS - 1:
+                    raise RunpodError(f"{what}: {type(exc).__name__}: {exc} (after {READ_ATTEMPTS} attempts)") from exc
+                time.sleep(READ_RETRY_BASE_S * (2 ** attempt))
+        raise AssertionError("unreachable")
 
     def cancel(self, endpoint_id: str, job_id: str) -> None:
         self._http.post(f"{SERVERLESS}/{endpoint_id}/cancel/{job_id}")
 
     def health(self, endpoint_id: str) -> dict:
-        r = self._http.get(f"{SERVERLESS}/{endpoint_id}/health")
+        r = self._read(f"{SERVERLESS}/{endpoint_id}/health", f"health of {endpoint_id}")
         _raise_for(r, f"health of {endpoint_id}")
         return r.json()
 
@@ -88,6 +102,19 @@ class Runpod:
         if body.get("errors"):
             raise RunpodError(f"graphql errors: {body['errors']}")
         return body["data"]
+
+    def endpoint_billing(self, *, start: float, end: float) -> list[dict]:
+        """Per-endpoint billing rows (timeBilledMs, amount) in daily UTC buckets covering
+        [start, end] (epoch seconds). Works after the endpoints are deleted; rows can lag
+        the usage by up to an hour."""
+        day = 86400
+        lo, hi = int(start // day * day), int((end // day + 1) * day)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        r = self._http.get(f"{REST}/billing/endpoints", params={
+            "bucketSize": "day", "grouping": "endpointId",
+            "startTime": time.strftime(fmt, time.gmtime(lo)), "endTime": time.strftime(fmt, time.gmtime(hi))})
+        _raise_for(r, "read endpoint billing")
+        return r.json()
 
     def endpoint(self, endpoint_id: str) -> dict:
         """Read-only view of a deployed endpoint, used to verify what `rp flash deploy` attached."""

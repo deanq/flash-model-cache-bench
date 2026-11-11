@@ -13,6 +13,9 @@ only in *where the bytes come from*:
 - gsvolumecache  HF cache on container disk, mirrored to Global Store by VolumeCache
 - gshydrate    plain model folder on Global Store, copied to container disk with many
                concurrent range reads, then loaded locally
+- volumeprefetch  same network-volume HF cache as `volume`, but read into the page cache
+               with concurrent range reads first (vLLM's `prefetch` load strategy), then
+               loaded in place; isolates the access pattern from the storage
 
 Every strategy resolves offline first and only calls the Hub when the files are
 not already usable -- that is the best-practice version of each strategy, and
@@ -35,7 +38,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate")
+STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate",
+              "volumeprefetch")
 
 VOLUME_ROOT = "/runpod-volume"
 LOCAL_ROOT = "/opt/hfbench"                       # container disk, outside /root/.cache
@@ -54,6 +58,10 @@ POPULATION_MIN_BYTES = 1 << 20
 # buffer pool on a busy 8-GPU host (ENOMEM storm, throughput fell to ~100 MiB/s).
 HYDRATE_WORKERS = 64
 HYDRATE_CHUNK_BYTES = 8 << 20
+# volumeprefetch tuning: the network-volume optimum measured for VolumeCache's hydrate
+# (testbeds-runpod-2.1: 8 x 64 MiB ~1000-1400 MiB/s vs 64 x 8 MiB ~360 MiB/s).
+PREFETCH_WORKERS = 8
+PREFETCH_CHUNK_BYTES = 64 << 20
 HYDRATE_RETRY_ERRNOS = frozenset({5, 11, 12})   # EIO, EAGAIN, ENOMEM: geesefs buffer pool exhausted
 HYDRATE_MAX_ATTEMPTS = 8
 HYDRATE_RETRY_BASE_S = 0.05
@@ -160,6 +168,62 @@ def acquire_volume(repo_id: str, token: str | None = None, *, hub_root: str = VO
     return Acquired(path=str(snap), timings=t, bytes_total=sum(p.stat().st_size for p in snapshot_files(snap)),
                     hub_online=downloaded, notes={"populated_now": downloaded},
                     shared_storage_files=[str(p) for p in snapshot_files(snap)])
+
+
+def acquire_volumeprefetch(repo_id: str, token: str | None = None, *, hub_root: str | None = None,
+                           workers: int = PREFETCH_WORKERS, chunk_bytes: int = PREFETCH_CHUNK_BYTES) -> Acquired:
+    """`volume`, plus a concurrent read of every snapshot file into the page cache before
+    load, so the lazy (mmap) safetensors load is served from RAM, not the volume.
+
+    shared_storage_files is empty on purpose: evicting after acquire would throw away the
+    prefetch. The caller evicts before (see runtime._acquire)."""
+    acq = acquire_volume(repo_id, token, hub_root=hub_root or VOLUME_HF_CACHE)
+    files = acq.shared_storage_files
+    t0 = time.monotonic()
+    stats = prefetch_files(files, workers=workers, chunk_bytes=chunk_bytes)
+    acq.timings["prefetch_s"] = time.monotonic() - t0
+    acq.notes.update(prefetch=stats, prefetched_files=files, cgroup_memory_max=cgroup_memory_limit())
+    acq.shared_storage_files = []
+    return acq
+
+
+def cgroup_memory_limit(path: str = "/sys/fs/cgroup/memory.max") -> int | str | None:
+    """Container memory limit (cgroup v2). Page cache counts against it, so a limit
+    below the model size means prefetched pages are evicted before the load reads them."""
+    try:
+        raw = Path(path).read_text().strip()
+    except OSError:
+        return None
+    return int(raw) if raw.isdigit() else raw
+
+
+def prefetch_files(paths: list[str], *, workers: int, chunk_bytes: int) -> dict:
+    """Read every byte of `paths` with `workers` concurrent `chunk_bytes` preads and
+    discard it: the point is the kernel page cache, not the data. A short read raises
+    with the file and offset. Returns {"files", "bytes", "ranges", "workers", "chunk_bytes"}."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    work = [(p, off, min(chunk_bytes, size - off))
+            for p in paths for size in (os.stat(p).st_size,) for off in range(0, size, chunk_bytes)]
+    work.sort(key=lambda w: (w[1], w[0]))      # spread concurrent readers across all files
+
+    def run(item: tuple[str, int, int]) -> int:
+        path, off, length = item
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            done = 0
+            while done < length:
+                n = len(os.pread(fd, min(length - done, chunk_bytes), off + done))
+                if not n:
+                    raise OSError(5, f"prefetch {path} @ {off}: short read, got {done} of {length} bytes")
+                done += n
+            return done
+        finally:
+            os.close(fd)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        read = sum(ex.map(run, work))
+    return {"files": len(paths), "bytes": read, "ranges": len(work), "workers": workers, "chunk_bytes": chunk_bytes}
 
 
 def load_volumecache_class():
@@ -403,6 +467,12 @@ def evict_page_cache(paths: list[str]) -> int:
         finally:
             os.close(fd)
     return advised
+
+
+def volume_snapshot_files(repo_id: str, hub_root: str | None = None) -> list[str]:
+    """Files of the `volume` HF cache snapshot, or [] before it is populated."""
+    snap = resolve_snapshot(hub_root or VOLUME_HF_CACHE, repo_id)
+    return [str(p) for p in snapshot_files(snap)] if snap else []
 
 
 def volumecache_mirror_files(namespace: str, volume_path: str = VOLUME_ROOT) -> list[str]:

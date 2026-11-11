@@ -150,10 +150,11 @@ def test_prime_never_runs_strategies_sharing_storage_at_once(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------- report
-def trial(strategy, phase, e2e, *, acquire=None, load=1.0, hydrate=None, valid=True, worker="w", rnd=1):
+def trial(strategy, phase, e2e, *, acquire=None, load=1.0, hydrate=None, prefetch=None, valid=True, worker="w",
+          rnd=1):
     cold = None
     if phase in ("cold", "prime"):
-        acq = {"hydrate_s": hydrate} if hydrate is not None else {}
+        acq = {k: v for k, v in (("hydrate_s", hydrate), ("prefetch_s", prefetch)) if v is not None}
         cold = {"import_s": 5.0, "acquire_s": acquire, "acquire": acq, "tokenizer_load_s": 0.0,
                 "model_load_s": load, "bytes": 2 ** 30, "hub_online": False}
     return {"strategy": strategy, "phase": phase, "round": rnd, "e2e_s": e2e, "delay_ms": 1000, "exec_ms": 2000,
@@ -173,6 +174,21 @@ def test_summary_and_verdict_compare_storage_time():
     assert verdict.startswith("**network volume: volumecache**") and "2.03×" in verdict
     assert report.verdicts(s) == [verdict]
     assert report.ranking(s) == ["volumecache", "volume"]
+
+
+def test_shared_storage_read_rate_uses_the_step_that_reads_the_storage():
+    """MiB/s off shared storage: the model load for in-place strategies, the hydrate or
+    prefetch for strategies that read it up front; nothing for a Hub download."""
+    trials = [trial("volume", "cold", 20, acquire=0.1, load=4.0),
+              trial("volumecache", "cold", 15, acquire=2.0, load=1.0, hydrate=1.0),
+              trial("volumeprefetch", "cold", 15, acquire=2.1, load=1.5, prefetch=0.5),
+              trial("nocache", "cold", 30, acquire=10, load=1.0)]
+    s = report.summarize(trials, ["volume", "volumecache", "volumeprefetch", "nocache"])
+    assert s["volume"]["read_mibps"].median == pytest.approx(256)
+    assert s["volumecache"]["read_mibps"].median == pytest.approx(1024)
+    assert s["volumeprefetch"]["read_mibps"].median == pytest.approx(2048)
+    assert s["volumeprefetch"]["hydrate"].median == pytest.approx(0.5)
+    assert s["nocache"]["read_mibps"].n == 0
 
 
 def test_stat_is_median_first_and_robust_to_outliers():
@@ -207,7 +223,9 @@ def test_waves_keep_shared_storage_strategies_apart():
     assert driver.waves(["nocache", "volume", "volumecache", "modelstore"]) == [
         ["nocache", "volume", "modelstore"], ["volumecache"]]
     assert driver.waves(list(config.STRATEGIES)) == [
-        ["nocache", "volume", "modelstore", "globalstore"], ["volumecache", "gsvolumecache"], ["gshydrate"]]
+        ["nocache", "volume", "modelstore", "globalstore"], ["volumecache", "gsvolumecache"],
+        ["gshydrate", "volumeprefetch"]]
+    assert driver.waves(["volume", "volumeprefetch"]) == [["volume"], ["volumeprefetch"]]
     assert driver.waves(["volumecache", "modelstore"]) == [["volumecache", "modelstore"]]
     assert driver.waves(["gsvolumecache"]) == [["gsvolumecache"]]
     assert driver.waves(["nocache", "globalstore", "gshydrate"]) == [["nocache", "globalstore"], ["gshydrate"]]
@@ -297,13 +315,15 @@ def _load_bench_app(monkeypatch, **env):
 
 def test_bench_app_registers_only_selected_strategies_with_their_storage(monkeypatch):
     app_mod = _load_bench_app(monkeypatch, BENCH_RUN_ID="t1", BENCH_APP="hfbench-t1",
-                              BENCH_STRATEGIES="nocache,volumecache,modelstore,gshydrate")
+                              BENCH_STRATEGIES="nocache,volumecache,modelstore,gshydrate,volumeprefetch")
     specs = {name: h.spec for name, h in app_mod.app.resources.items()}
     assert app_mod.app.name == "hfbench-t1"
-    assert sorted(specs) == ["hfbench-gshydrate", "hfbench-modelstore", "hfbench-nocache", "hfbench-volumecache"]
+    assert sorted(specs) == ["hfbench-gshydrate", "hfbench-modelstore", "hfbench-nocache", "hfbench-volumecache",
+                             "hfbench-volumeprefetch"]
     manifest = {n: s.to_manifest() for n, s in specs.items()}
     assert manifest["hfbench-volumecache"]["mounts"] == [
         {"kind": "network", "reference": "hfbench-t1", "path": "/runpod-volume"}]
+    assert manifest["hfbench-volumeprefetch"]["mounts"] == manifest["hfbench-volumecache"]["mounts"]
     assert manifest["hfbench-gshydrate"]["mounts"] == [
         {"kind": "global", "reference": "hfbench-t1", "path": "/runpod-volume"}]
     assert "mounts" not in manifest["hfbench-nocache"]
@@ -314,6 +334,104 @@ def test_bench_app_registers_only_selected_strategies_with_their_storage(monkeyp
     assert nocache["dependencies"] == app_mod.DEPENDENCIES
     # the worker imports the module too: it must see the same app and selection
     env = nocache["env"]
-    assert env["BENCH_APP"] == "hfbench-t1" and env["BENCH_STRATEGIES"] == "nocache,volumecache,modelstore,gshydrate"
+    assert env["BENCH_APP"] == "hfbench-t1" and env["BENCH_STRATEGIES"] == "nocache,volumecache,modelstore,gshydrate,volumeprefetch"
     # unselected strategies stay plain functions (not deployed); selected ones keep their names
     assert not hasattr(app_mod.hfbench_volume, "spec") and app_mod.hfbench_nocache.spec.name == "hfbench-nocache"
+
+
+def test_usage_reports_wall_clock_handler_and_billed_gpu_minutes_for_this_run_only():
+    meta = {"started_at": 1000.0, "finished_at": 1000.0 + 90 * 60, "endpoints": {"volume": "e1", "nocache": "e2"}}
+    trials = [trial("volume", "cold", 20), trial("nocache", "warm", 5)]       # exec_ms 2000 each
+    billing = [{"endpointId": "e1", "timeBilledMs": 120_000, "amount": 0.5},
+               {"endpointId": "e2", "timeBilledMs": 60_000, "amount": 0.25},
+               {"endpointId": "e2", "timeBilledMs": 60_000, "amount": 0.25},   # second day bucket
+               {"endpointId": "other-run", "timeBilledMs": 10 ** 9, "amount": 99.0}]
+    u = report.usage(meta, trials, billing)
+    assert u["wall_clock_min"] == pytest.approx(90)
+    assert u["handler_gpu_min"] == pytest.approx(4000 / 60000)
+    assert u["billed_gpu_min"] == pytest.approx(4.0) and u["billed_usd"] == pytest.approx(1.0)
+    assert u["billed_gpu_min_by_strategy"] == {"volume": pytest.approx(2.0), "nocache": pytest.approx(2.0)}
+
+
+def test_usage_without_billing_leaves_billed_fields_empty():
+    u = report.usage({"started_at": 0.0, "endpoints": {}}, [], None)
+    assert u["wall_clock_min"] is None and u["billed_gpu_min"] is None and u["handler_gpu_min"] == 0
+
+
+def test_summary_json_carries_run_usage_next_to_strategies(tmp_path):
+    meta = {"run_id": "r", "model": "A/B", "gpu": "AMPERE_80", "datacenter": "EU-RO-1", "cold_trials": 1,
+            "warm_per_cold": 0, "parallel": True, "evict_page_cache": True, "strategies": ["nocache"],
+            "started_at": 0.0, "finished_at": 600.0, "endpoints": {"nocache": "e2"}}
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    (tmp_path / "results.jsonl").write_text(json.dumps(trial("nocache", "cold", 30, acquire=10)))
+    (tmp_path / "billing.json").write_text(json.dumps([{"endpointId": "e2", "timeBilledMs": 60_000, "amount": 0.1}]))
+    md = open(report.write(str(tmp_path))).read()
+    data = json.loads((tmp_path / "summary.json").read_text())
+    assert data["usage"]["billed_gpu_min"] == pytest.approx(1.0) and data["strategies"]["nocache"]["cold_n"] == 1
+    assert "## Time and cost" in md and "billed GPU time: 1.0 GPU-min" in md
+
+
+def test_billing_rows_cover_the_run_window_in_daily_buckets():
+    import httpx
+    from bench.runpod_api import Runpod
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=[{"endpointId": "e1", "timeBilledMs": 1, "amount": 0.0}])
+
+    rp = Runpod(key="k", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    rows = rp.endpoint_billing(start=1793772060.0, end=1793772967.0)   # 2026-11-04 UTC
+    assert rows == [{"endpointId": "e1", "timeBilledMs": 1, "amount": 0.0}]
+    q = seen[0].url.params
+    assert seen[0].url.path == "/v1/billing/endpoints" and q["bucketSize"] == "day"
+    assert (q["startTime"], q["endTime"]) == ("2026-11-04T00:00:00Z", "2026-11-05T00:00:00Z")
+
+
+def test_cmd_billing_writes_billing_json_and_rerenders(tmp_path, monkeypatch):
+    from bench import __main__ as cli
+
+    run_dir = tmp_path / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    meta = {"run_id": "r1", "model": "A/B", "gpu": "AMPERE_80", "datacenter": "EU-RO-1", "cold_trials": 1,
+            "warm_per_cold": 0, "parallel": True, "evict_page_cache": True, "strategies": ["nocache"],
+            "started_at": 10.0, "finished_at": 70.0, "endpoints": {"nocache": "e2"}}
+    (run_dir / "meta.json").write_text(json.dumps(meta))
+    (run_dir / "results.jsonl").write_text(json.dumps(trial("nocache", "cold", 30, acquire=10)))
+
+    class FakeBilling:
+        def endpoint_billing(self, start, end):
+            assert (start, end) == (10.0, 70.0)
+            return [{"endpointId": "e2", "timeBilledMs": 120_000, "amount": 0.2}]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "Runpod", FakeBilling)
+    assert cli.main(["billing", "r1"]) == 0
+    assert json.loads((run_dir / "billing.json").read_text())[0]["endpointId"] == "e2"
+    assert json.loads((run_dir / "summary.json").read_text())["usage"]["billed_gpu_min"] == pytest.approx(2.0)
+
+
+def test_status_polls_survive_transient_connection_resets(monkeypatch):
+    """A 40-min run died on one `Connection reset by peer` while polling. Reads are
+    idempotent, so retry them; a persistent outage still surfaces as RunpodError."""
+    import httpx
+    from bench import runpod_api
+    from bench.runpod_api import Runpod
+
+    monkeypatch.setattr(runpod_api, "READ_RETRY_BASE_S", 0)
+    calls = []
+
+    def flaky(request):
+        calls.append(request.url.path)
+        if len(calls) <= 2:
+            raise httpx.ReadError("[Errno 54] Connection reset by peer")
+        return httpx.Response(200, json={"status": "COMPLETED"})
+
+    rp = Runpod(key="k", client=httpx.Client(transport=httpx.MockTransport(flaky)))
+    assert rp.status("e", "j")["status"] == "COMPLETED" and len(calls) == 3
+
+    down = Runpod(key="k", client=httpx.Client(transport=httpx.MockTransport(
+        lambda r: (_ for _ in ()).throw(httpx.ConnectError("unreachable")))))
+    with pytest.raises(RunpodError, match="health of e: ConnectError"):
+        down.health("e")

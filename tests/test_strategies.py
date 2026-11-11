@@ -275,3 +275,65 @@ def test_gshydrate_populates_once_then_hydrates_locally_without_the_hub(tmp_path
     assert second.notes["leftover_bytes"] == first.bytes_total + 3   # previous hydrate + stray file
     assert "hydrate_s" in second.timings and second.notes["hydrate"]["bytes"] == 4096 + 2
     assert second.shared_storage_files                          # benchmark evicts these before reading
+
+
+# ---------------------------------------------------------- volumeprefetch
+def test_prefetch_files_reads_every_byte_across_chunk_boundaries(tmp_path, monkeypatch):
+    sizes = {"a.safetensors": 10_000, "b.safetensors": 4096, "empty.json": 0}
+    for name, size in sizes.items():
+        (tmp_path / name).write_bytes(os.urandom(size))
+    read: list[int] = []
+    real_pread = os.pread
+
+    def counting_pread(fd, n, off):
+        buf = real_pread(fd, n, off)
+        read.append(len(buf))
+        return buf
+
+    monkeypatch.setattr(st.os, "pread", counting_pread)
+    stats = st.prefetch_files([str(tmp_path / n) for n in sizes], workers=3, chunk_bytes=4096)
+    assert stats["bytes"] == sum(sizes.values()) == sum(read)
+    assert stats["files"] == 3 and stats["ranges"] == 3 + 1   # 10_000 -> 3 chunks, 4096 -> 1, empty -> 0
+    assert (stats["workers"], stats["chunk_bytes"]) == (3, 4096)
+
+
+def test_prefetch_files_reports_short_reads_with_the_path(tmp_path, monkeypatch):
+    f = tmp_path / "w.safetensors"
+    f.write_bytes(b"x" * 100)
+    monkeypatch.setattr(st.os, "pread", lambda fd, n, off: b"")
+    with pytest.raises(OSError, match="w.safetensors @ 0"):
+        st.prefetch_files([str(f)], workers=1, chunk_bytes=64)
+
+
+def test_volumeprefetch_loads_in_place_from_the_volume_cache_after_prefetching(tmp_path):
+    snap = make_hf_cache(tmp_path, weight_bytes=9000)
+    acq = st.acquire_volumeprefetch(REPO, hub_root=str(tmp_path), workers=2, chunk_bytes=4096)
+    assert acq.path == str(snap)                     # model is loaded straight off the volume
+    assert acq.hub_online is False and "prefetch_s" in acq.timings
+    assert acq.notes["prefetch"]["bytes"] == acq.bytes_total == 9000 + 2
+    # The load must hit the pages just prefetched: nothing to evict between acquire and load.
+    assert acq.shared_storage_files == []
+    assert sorted(acq.notes["prefetched_files"]) == sorted(str(p) for p in st.snapshot_files(snap))
+
+
+def test_runtime_evicts_volumeprefetch_files_before_prefetching_not_after(tmp_path, monkeypatch):
+    import runtime
+
+    make_hf_cache(tmp_path)
+    calls: list[str] = []
+    real_prefetch = st.prefetch_files
+    monkeypatch.setattr(st, "VOLUME_HF_CACHE", str(tmp_path))
+    monkeypatch.setattr(st, "evict_page_cache", lambda paths: calls.append("evict") or 7)
+    monkeypatch.setattr(st, "prefetch_files", lambda *a, **k: calls.append("prefetch") or real_prefetch(*a, **k))
+    acq = runtime._acquire("volumeprefetch", REPO, None, evict=True)
+    assert calls == ["evict", "prefetch"]
+    assert acq.notes["evicted_volume_bytes"] == 7 and acq.shared_storage_files == []
+
+
+def test_cgroup_memory_limit_reads_v2_and_reports_unlimited_or_missing(tmp_path):
+    f = tmp_path / "memory.max"
+    f.write_text("68719476736\n")
+    assert st.cgroup_memory_limit(str(f)) == 68719476736
+    f.write_text("max\n")
+    assert st.cgroup_memory_limit(str(f)) == "max"
+    assert st.cgroup_memory_limit(str(tmp_path / "absent")) is None

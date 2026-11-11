@@ -36,6 +36,13 @@ def _acquire(strategy: str, model_id: str, token: str | None, evict: bool) -> st
         return strategies.acquire_nocache(model_id, token)
     if strategy == "volume":
         return strategies.acquire_volume(model_id, token)
+    if strategy == "volumeprefetch":
+        # The prefetch reads the volume during acquire, so evict before, not after.
+        files = strategies.volume_snapshot_files(model_id)
+        evicted = strategies.evict_page_cache(files) if evict else 0
+        acq = strategies.acquire_volumeprefetch(model_id, token)
+        acq.notes["evicted_volume_bytes"] = evicted
+        return acq
     if strategy in ("volumecache", "gsvolumecache"):
         # Same code on both backends: runpod>=2.1.0's VolumeCache copies with copyfile
         # and best-effort metadata, so it works on Global Store without a patch.

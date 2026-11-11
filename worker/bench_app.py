@@ -20,8 +20,9 @@ from runpod import App, GlobalVolume, Model, NetworkVolume
 import runtime
 
 ENDPOINT_PREFIX = "hfbench-"
-ALL_STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate")
-NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache")
+ALL_STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate",
+                  "volumeprefetch")
+NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache", "volumeprefetch")
 GLOBAL_STORE_STRATEGIES = ("globalstore", "gsvolumecache", "gshydrate")
 DEPENDENCIES = ["transformers>=4.56", "accelerate>=1.0", "safetensors"]
 
@@ -119,3 +120,8 @@ async def hfbench_gsvolumecache(**payload) -> dict:
 @bench_endpoint("gshydrate")
 async def hfbench_gshydrate(**payload) -> dict:
     return runtime.handle("gshydrate", payload)
+
+
+@bench_endpoint("volumeprefetch")
+async def hfbench_volumeprefetch(**payload) -> dict:
+    return runtime.handle("volumeprefetch", payload)
