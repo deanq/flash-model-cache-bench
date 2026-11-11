@@ -324,6 +324,8 @@ def usage(meta: dict, trials: list[dict], billing: list[dict] | None) -> dict:
         return out
     by_id = {eid: s for s, eid in (meta.get("endpoints") or {}).items()}
     mine = [row for row in billing if row.get("endpointId") in by_id]
+    if not mine:                       # billing lags usage by hours: unbilled so far, not free
+        return out
     per: dict[str, float] = {}
     for row in mine:
         s = by_id[row["endpointId"]]
@@ -338,7 +340,7 @@ def _usage_lines(u: dict) -> list[str]:
         return "—" if v is None else format(v, fmt)
     billed = (f"billed GPU time: {num(u['billed_gpu_min'], '.1f')} GPU-min, ${num(u['billed_usd'], '.2f')} "
               f"(Runpod billing API, this run's endpoints only)" if u["billed_gpu_min"] is not None
-              else "billed GPU time: not fetched yet (`make billing RUN=<id>`; billing lags by up to an hour)")
+              else "billed GPU time: not in the billing API yet (`make billing RUN=<id>` later; billing can lag usage by several hours)")
     lines = ["## Time and cost", "",
              f"- wall clock (deploy → teardown): {num(u['wall_clock_min'], '.1f')} min",
              f"- handler time (sum of `executionTime`): {u['handler_gpu_min']:.1f} GPU-min",

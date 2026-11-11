@@ -465,3 +465,11 @@ def test_makeup_rounds_are_capped(tmp_path, monkeypatch):
     rec = _makeup_driver(tmp_path, monkeypatch, {"a": [completed({"cold_process": True})] * 2,
                                                  "b": [timeout] * 10}, makeup="1")
     assert [t.round for t in rec.trials if t.strategy == "volume"] == [1, 2, 3]
+
+
+def test_usage_reports_not_yet_billed_instead_of_zero_when_no_rows_match():
+    """Billing lags hours; a run absent from the rows is unbilled-so-far, not free."""
+    meta = {"started_at": 0.0, "finished_at": 60.0, "endpoints": {"volume": "e1"}}
+    u = report.usage(meta, [], [{"endpointId": "someone-else", "timeBilledMs": 5, "amount": 1.0}])
+    assert u["billed_gpu_min"] is None and u["billed_usd"] is None
+    assert "not fetched yet" in "\n".join(report._usage_lines(u)) or "not in the billing" in "\n".join(report._usage_lines(u))
