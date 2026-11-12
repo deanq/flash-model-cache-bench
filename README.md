@@ -4,7 +4,7 @@
 
 This repo benchmarks eight model-storage strategies side by side on real Runpod Serverless GPU
 workers deployed with Runpod Flash — the `runpod.apps` SDK and `rp flash` CLI built into
-[runpod-python](https://github.com/runpod/runpod-python) 2.1+. It measures the whole AI
+[runpod-python](https://github.com/runpod/runpod-python) 2.2+. It measures the whole AI
 task: getting the weights, loading them to the GPU, and generating text. Anyone with a Runpod
 account can reproduce the numbers below with two commands:
 
@@ -21,11 +21,86 @@ or you press Ctrl-C.
 
 ## Findings
 
-Measured 2026-09-25 on NVIDIA RTX 4090 workers in `EU-RO-1`, with Flash 1.20.0, transformers 5.17.0
+Measured 2026-11-11 on **NVIDIA H100 80GB HBM3** workers (`GPU=ADA_80_PRO`; every trial landed on
+H100 SXM) in `US-CA-2`, with runpod-python 2.2.1, torch 2.9.1+cu128 and transformers 5.22.2. Five
+strategies, **5 valid forced-cold trials each**, page cache evicted before every storage read.
+Medians unless noted; ranges and raw data are in [`results/`](results/).
+
+### Time the storage strategy controls (get the bytes + load them to GPU)
+
+| strategy | Qwen2.5-3B-Instruct (5.8 GiB) | Qwen2.5-7B-Instruct (14.2 GiB) | read off shared storage (3B / 7B) |
+|---|---|---|---|
+| `nocache`: download from HF + load | 16.7s | 39.7s | – |
+| `volume`: load from the network volume (lazy safetensors mmap) | 16.2s | 26.6s | 374 / 554 MiB/s |
+| `volumeprefetch`: same files, parallel page-cache prefetch, then load in place | 7.0s (2.8 + 4.3) | 12.5s (5.1 + 6.1) | 2107 / 2840 MiB/s |
+| `volumecache`: hydrate to container disk + local load | 6.6s (2.0 + 3.7) | **8.6s** (2.6 + 5.4) | 2999 / 5624 MiB/s |
+| `modelstore`: load from Runpod cached model | **5.9s** | 9.7s | 1044 / 1535 MiB/s |
+
+### Whole cold request, as a client sees it
+
+Model Store stages the model before the container starts, so its cost is in Runpod's `delayTime`,
+not in storage time. GPU capacity waits also land in `delayTime` and hit every strategy at random,
+which makes medians noisy. The **best case** (minimum over 5 trials) approximates a cold start with
+no capacity wait:
+
+| strategy | best case (3B / 7B) | of which platform delay (3B / 7B) | median (3B / 7B) |
+|---|---|---|---|
+| `volumecache` | **24.5s / 23.6s** | 14.4s / 11.2s | 109.7s / **30.3s** |
+| `volumeprefetch` | 26.9s / 28.1s | 13.2s / 11.8s | 114.1s / 69.3s |
+| `volume` | 32.5s / 46.2s | 11.4s / 9.5s | **34.8s** / 104.8s |
+| `nocache` | 33.6s / 51.5s | 12.6s / 9.9s | 114.0s / 58.9s |
+| `modelstore` | 70.5s / 95.1s | **58.8s / 80.3s** | 83.2s / 107.0s |
+
+### What this means
+
+1. **Loading in place from a network volume is slow because of the access pattern, not the
+   volume.** The default lazy (mmap) safetensors load read the volume at 374–554 MiB/s. Reading
+   the *same files on the same volume* with 8 concurrent 64 MiB range reads first (`volumeprefetch`,
+   the approach behind vLLM's `prefetch` load strategy) ran at 2.1–2.8 GiB/s, 5–6× faster, and the
+   load that followed was served from RAM. That closed 96% (3B) and 78% (7B) of the storage-time gap
+   between loading in place and VolumeCache.
+2. **VolumeCache is still the fastest way off a network volume, end to end.** It had the best
+   best-case cold request for both models (~24s) and the best 7B median. Its copy (3.0–5.6 GiB/s)
+   beat the prefetch's pread-and-discard reader, which is untuned: treat 2.1–2.8 GiB/s as a lower
+   bound for a parallel in-place reader.
+3. **Model Store loads fastest once the worker runs, and is slowest end to end.** Its handler was the
+   quickest (11–14s), but its platform delay never went below 59s (3B) or 80s (7B), against ~10–14s
+   for every other strategy. Two of its 3B trials got no worker within 20 minutes. From these numbers
+   we can't tell whether that time is staging the model or waiting for a host that has it; both
+   land in `delayTime`.
+4. **A network volume clearly beats a fresh download only with a fast reader.** Plain in-place
+   loading was on par with downloading from Hugging Face for 3B (16.2 vs 16.7s) and ahead for 7B
+   (26.6 vs 39.7s); prefetched or hydrated, it was 2.4–4.6× faster than the download.
+5. **Once the model is in VRAM, storage doesn't matter.** Warm medians were 66–71 tokens/s (3B) and
+   85–89 tokens/s (7B) across strategies.
+
+Caveats:
+
+- H100 capacity in `US-CA-2` was tight. Four cold trials got no worker within the 20-minute trial
+  timeout; those strategies (`volume`, `volumeprefetch`, `modelstore` on 3B) got their fifth trial
+  from a top-up run with the same GPU, datacenter and code, merged into the 3B report.
+- A100s were not usable on the same day: A100 workers in `EU-RO-1` waited up to 21 minutes, and a
+  probe of A100/H100 in `EU-RO-1`, `US-IL-1` and `US-CA-2` got workers only for H100 in `US-CA-2`.
+- Exact seconds vary with datacenter, host and time of day. Compare strategies within a run.
+
+Full reports: [`results/h100-qwen3b/report.md`](results/h100-qwen3b/report.md) ·
+[`results/h100-qwen7b/report.md`](results/h100-qwen7b/report.md).
+
+Cost: the 3B run (main + top-up) took 109.5 min wall clock and **29.4 billed GPU-minutes ($2.64)**;
+the 7B run took 33.1 min and **25.8 billed GPU-minutes ($2.32)**. Billed time is about 2× the summed
+handler time, because worker start-up is billed too.
+
+---
+
+## Earlier runs
+
+### 2026-09-25: six strategies including Global Store (RTX 4090, `EU-RO-1`)
+
+Measured on NVIDIA RTX 4090 workers in `EU-RO-1`, with Flash 1.20.0, transformers 5.17.0
 and torch 2.9.1. All values are **medians over forced cold starts**; ranges and raw data are in
 [`results/`](results/).
 
-### Time the storage strategy controls (get the bytes + load them to GPU)
+#### Time the storage strategy controls
 
 | strategy | Qwen2.5-3B-Instruct (5.8 GiB) | Qwen2.5-7B-Instruct (14.2 GiB) |
 |---|---|---|
@@ -36,7 +111,7 @@ and torch 2.9.1. All values are **medians over forced cold starts**; ranges and 
 | `globalstore`: load directly from Global Store | 48.1s | 98.9s |
 | `gsvolumecache`: hydrate from Global Store + local load | 24.3s (21.1 + 1.5) | 81.4s ⚠️ see finding 4 |
 
-### Whole cold request, as a client sees it
+#### Whole cold request, as a client sees it
 
 | strategy | 3B | 7B | of which: waiting for a worker (`delayTime`, 3B / 7B) |
 |---|---|---|---|
@@ -47,7 +122,7 @@ and torch 2.9.1. All values are **medians over forced cold starts**; ranges and 
 | `globalstore` | 92.5s | 133.6s | 30.4s / 20.2s |
 | `modelstore` | 106.0s | 81.2s | **98.6s / 69.3s** |
 
-### What this means
+#### What this means
 
 1. **Copy to local disk first; don't load from shared storage.** On both backends, VolumeCache
    (hydrate to container disk, then load) beat loading directly from the mount. It won in 8 of 8
@@ -95,7 +170,7 @@ Full reports: [`results/qwen3b-gs/report.md`](results/qwen3b-gs/report.md) ·
 the same day ([`results/qwen3b`](results/qwen3b/report.md),
 [`results/qwen7b`](results/qwen7b/report.md)) agree with them.
 
-### Re-run on runpod 2.1.0 (2026-11-03)
+### 2026-11-03: re-run on runpod 2.1.0 (RTX 4090, `EU-RO-1`)
 
 The tables above were measured with `runpod-flash` 1.20 and a vendored VolumeCache from runpod 1.12.
 After moving the harness to the Flash built into runpod 2.1.0, a smaller 3B run (3 cold trials,
@@ -117,6 +192,10 @@ cache evicted before each try, `hydrate_workers=8, hydrate_chunk_size=64 MiB` ra
 (5.9s vs 15.8–17.3s, 2 repetitions each); one worker × 1 GiB ran at ~360 MiB/s and a plain sequential
 `copyfile` at ~460 MiB/s. That is an SDK default to fix upstream; the harness measures stock VolumeCache
 and doesn't tune it.
+
+runpod 2.2.1 keeps the 64 × 8 MiB default, yet on H100 workers in `US-CA-2` (above) VolumeCache hydrated
+at ~3.0 GiB/s (3B) and ~5.6 GiB/s (7B). The 2.1.0 slowdown therefore depends on the host and volume
+cluster, not only on the default.
 
 ---
 
@@ -144,12 +223,18 @@ $EDITOR .env          # set RUNPOD_API_KEY=...   (or run: uv run rp login)
 make run              # report written to runs/<run-id>/report.md
 ```
 
-To reproduce the published six-strategy runs:
+To reproduce the published H100 runs:
 
 ```bash
-make run COLD_TRIALS=5 RUN_ID=qwen3b-gs                                          # Qwen2.5-3B (default model)
-make run MODEL=Qwen/Qwen2.5-7B-Instruct COLD_TRIALS=3 VOLUME_GB=60 RUN_ID=qwen7b-gs
+S=nocache,volume,volumecache,volumeprefetch,modelstore
+make run GPU=ADA_80_PRO DATACENTER=US-CA-2 STRATEGIES=$S COLD_TRIALS=5 RUN_ID=h100-qwen3b
+make run GPU=ADA_80_PRO DATACENTER=US-CA-2 STRATEGIES=$S COLD_TRIALS=5 VOLUME_GB=60 \
+         MODEL=Qwen/Qwen2.5-7B-Instruct RUN_ID=h100-qwen7b
+make billing RUN=h100-qwen3b    # an hour or more later: billed GPU-minutes and cost
 ```
+
+`MAKEUP_ROUNDS` (default 3) re-runs only the strategies that end short of `COLD_TRIALS` valid
+trials, e.g. when no worker started within the trial timeout.
 
 Other targets:
 
@@ -162,11 +247,12 @@ Other targets:
 
 ### Time and cost
 
-Every endpoint is capped at one worker (`workers=(0, 1)`), so at most six GPU workers exist at a
-time, and only during a trial. The published runs used **~20–25 GPU-minutes of handler time** each.
-Wall time was 33 minutes for 7B and 92 minutes for 3B; the 3B run was stretched by GPU capacity
-waits, which aren't billed as worker time. On top of that, a network volume and a Global Store
-exist only for the run. At Serverless RTX 4090 prices this is a few dollars per run.
+Every endpoint is capped at one worker (`workers=(0, 1)`), so at most one GPU worker per strategy
+exists at a time, and only during a trial. The published H100 runs billed **25–30 GPU-minutes
+($2.30–2.65) each**; wall time was 33 minutes (7B) and 110 minutes (3B, stretched by H100 capacity
+waits, which aren't billed). A network volume (and a Global Store, if selected) exists only for the
+run. `make billing RUN=<id>` adds wall clock, handler time and billed GPU-minutes/cost to the
+report; Runpod's billing data can lag usage by several hours.
 
 To go faster, run a subset: `make run STRATEGIES=volume,volumecache COLD_TRIALS=3`.
 
@@ -201,10 +287,16 @@ Set them in `.env` or on the command line (`make run MODEL=... COLD_TRIALS=5`).
   start) and `executionTime`; Python import time; acquire (split into hydrate and Hub time);
   tokenizer and model load; **storage total**; and the first generation. Cells show
   `median [min–max]`.
+  It also shows each strategy's read rate off shared storage (MiB/s).
+- **Overall cold request**: whole-request median, platform delay and handler time, plus the best
+  case (minimum), ranked by best case. Use this to compare `modelstore`, whose staging happens
+  before the container starts.
 - **Warm requests**: latency and tokens/s with the model already in GPU memory.
 - **First-ever request**: the one-time cost of filling each cache.
 - **Observations**: flags generated automatically, such as Hub use on cold starts and unusually long
   worker waits.
+- **Time and cost**: wall clock, summed handler time and (after `make billing`) billed GPU-minutes
+  and cost, per strategy.
 
 Raw data is in `results.jsonl`, one line per request, including everything the handler returned:
 worker id, GPU, package versions, byte counts, and VolumeCache's hydrated/fetched/mirrored bytes
@@ -214,9 +306,9 @@ and copy errors.
 
 ## How it works
 
-### The seven strategies
+### The eight strategies
 
-All seven are queue-based GPU endpoints running **the same handler code** on the same GPU class in
+All eight are queue-based GPU endpoints running **the same handler code** on the same GPU class in
 the same datacenter. Only where the model bytes come from differs.
 
 | strategy | on a cold start |
@@ -228,6 +320,7 @@ the same datacenter. Only where the model bytes come from differs.
 | `globalstore` | a [global volume](https://docs.runpod.io/storage/globalvolume/globalvolume-serverless) mounted at `/runpod-volume`; the model is loaded straight from a plain folder of files on it |
 | `gsvolumecache` | like `volumecache`, but the mirror lives on the global volume |
 | `gshydrate` | the `globalstore` folder, copied to container disk with 64 concurrent 8 MiB range reads, then loaded locally |
+| `volumeprefetch` | the `volume` HF cache, read once into the page cache with 8 concurrent 64 MiB range reads, then loaded straight from the mount (pages come from RAM) |
 
 A global volume and a network volume can't be attached to the same endpoint, so the
 Global Store strategies get their own endpoints. Global volumes don't tie an endpoint to a
@@ -241,7 +334,7 @@ and greedily generates exactly `MAX_NEW_TOKENS` tokens.
 1. **Preflight**: API key present; no app `hfbench-<id>` exists yet.
 2. **Deploy**: `rp flash deploy --env run-<id>` in `worker/` creates app `hfbench-<id>` with one
    endpoint per selected strategy. Storage is declared in `worker/bench_app.py` and created by
-   the deploy: a `NetworkVolume` `hfbench-<id>` for `volume`/`volumecache`, a `GlobalVolume`
+   the deploy: a `NetworkVolume` `hfbench-<id>` for `volume`/`volumecache`/`volumeprefetch`, a `GlobalVolume`
    `hfbench-<id>` for the Global Store strategies, and `model=runpod.Model(MODEL)`
    (`modelReferences`) on `modelstore`. Every run is its own app, so teardown can't touch anything
    else in the account.
@@ -252,8 +345,9 @@ and greedily generates exactly `MAX_NEW_TOKENS` tokens.
    - Every endpoint is paused (`workersMax=0`) until `/health` reports zero workers, then
      restored, so the next request is guaranteed to hit a fresh worker.
    - Each strategy then gets 1 cold request and `WARM_PER_COLD` warm ones.
-   - Strategies that share storage (`volume`/`volumecache`, `globalstore`/`gsvolumecache`/`gshydrate`)
-     run in different waves, so they never compete for bandwidth.
+   - Strategies that share storage (`volume`/`volumecache`/`volumeprefetch`,
+     `globalstore`/`gsvolumecache`/`gshydrate`) run in different waves, so they never compete for bandwidth.
+   - Then up to `MAKEUP_ROUNDS` extra rounds, only for strategies short of `COLD_TRIALS` valid trials.
 6. **Report**: `runs/<id>/report.md` and `summary.json`.
 7. **Teardown** (always):
    - `rp flash app delete hfbench-<id> --yes` removes the endpoints and the app.
@@ -283,18 +377,20 @@ and greedily generates exactly `MAX_NEW_TOKENS` tokens.
 - **Every strategy tries its cache offline before calling the Hub.** The report counts the cold
   starts that still needed the Hub.
 - **The page cache is evicted** (`posix_fadvise(DONTNEED)`) for files read from shared storage,
-  so the benchmark reads from storage, not RAM. This doesn't reach a FUSE client's own cache
+  so the benchmark reads from storage, not RAM. `volumeprefetch` evicts *before* its prefetch, so
+  only its own read warms the cache; it records the container's cgroup `memory.max` (251 GB on the
+  H100 workers), since a limit below the model size would evict prefetched pages before the load. This doesn't reach a FUSE client's own cache
   (MooseFS client, geesefs).
 - **Medians instead of means.** Worker placement produces outliers (18-minute waits next to 10s
   ones) that pull a mean far from the typical case.
 - **VolumeCache is the SDK's own.** `rp flash deploy` vendors the deploying client's runpod package
-  into the build artifact, so workers run the same runpod (2.1.0) as your machine; `notes.impl`
-  records the version. 2.1.0's VolumeCache hydrates big files with concurrent range reads (64 × 8 MiB
+  into the build artifact, so workers run the same runpod (2.2.1) as your machine; `notes.impl`
+  records the version. Since 2.1.0, VolumeCache hydrates big files with concurrent range reads (64 × 8 MiB
   by default) and treats file metadata as best-effort, so it no longer drops files on Global Store.
 
 ### Gaps found while building this
 
-Status with runpod 2.1.0 (the harness was first built on standalone `runpod-flash` 1.20):
+Status with runpod 2.1.0–2.2.1 (the harness was first built on standalone `runpod-flash` 1.20):
 
 - **Model Store and Global Store are now first-class.** `model=runpod.Model(...)` sets
   `modelReferences`, and `mounts={"/runpod-volume": runpod.GlobalVolume(name)}` creates and attaches
@@ -316,6 +412,8 @@ Status with runpod 2.1.0 (the harness was first built on standalone `runpod-flas
   reads the metadata. The harness records `runpod._version` as `versions.runpod_code`.
 - **VolumeCache's default hydrate (64 × 8 MiB ranges) is ~3× slower than 8 × 64 MiB on a network
   volume.** See "Re-run on runpod 2.1.0" above.
+- **`runpod.GpuType` has no L40 or L40S, and `GpuGroup.ADA_48_PRO` maps only to the RTX 6000 Ada**
+  (2.2.1), so the SDK can't target L40S, a common datacenter card.
 - **Flash endpoints still put your `RUNPOD_API_KEY` in the endpoint's environment,** where anyone
   who can read the endpoint config can see it. The harness never prints endpoint env.
 
@@ -330,7 +428,9 @@ Status with runpod 2.1.0 (the harness was first built on standalone `runpod-flas
   gated model without `HF_TOKEN`.
 - **Trials waiting many minutes for a worker**: that's GPU capacity in the datacenter; it shows
   up in `delayTime`. Try another `DATACENTER` or add a GPU class (`GPU=ADA_24,AMPERE_24`), which
-  mixes hardware types.
+  mixes hardware types. To find capacity, run the harness itself as a probe in a few places:
+  `make run STRATEGIES=nocache COLD_TRIALS=1 WARM_PER_COLD=0 GPU=... DATACENTER=... RUN_ID=probe-...`.
+  Pod stock APIs don't reflect Serverless capacity.
 
 ---
 
@@ -340,14 +440,14 @@ Status with runpod 2.1.0 (the harness was first built on standalone `runpod-flas
 worker/                 `rp flash deploy` root (the build artifact's source)
   bench_app.py          runpod.App with one @app.queue endpoint per selected strategy, plus its storage
   runtime.py            request handling: cold load vs warm, timings, provenance
-  strategies.py         the seven acquisition strategies (unit-tested)
+  strategies.py         the eight acquisition strategies (unit-tested)
 bench/                  orchestrator (runs on your machine)
-  __main__.py           run / report / clean / preflight
+  __main__.py           run / report / billing / clean / preflight
   config.py             env-var config, validated before anything is deployed
   deploy.py             rp flash deploy/teardown, attachment checks, volume cleanup, state file for recovery
   driver.py             prime, forced-cold rounds in shared-storage waves, warm follow-ups
-  runpod_api.py         job/health API; workersMax (REST v2 PATCH); app/env lookup; volume cleanup
-  report.py             results.jsonl -> report.md
+  runpod_api.py         job/health API; workersMax (REST v2 PATCH); app/env lookup; volume cleanup; billing
+  report.py             results.jsonl -> report.md + summary.json
 results/                the published runs (report, raw trials, summary, config)
 tests/                  `make test` — no network, no spend
 ```
