@@ -473,3 +473,43 @@ def test_usage_reports_not_yet_billed_instead_of_zero_when_no_rows_match():
     u = report.usage(meta, [], [{"endpointId": "someone-else", "timeBilledMs": 5, "amount": 1.0}])
     assert u["billed_gpu_min"] is None and u["billed_usd"] is None
     assert "not fetched yet" in "\n".join(report._usage_lines(u)) or "not in the billing" in "\n".join(report._usage_lines(u))
+
+
+def test_render_has_overall_cold_request_table_with_best_case():
+    """Model Store stages before the container starts: its cost is in delayTime, not
+    storage time, so the report must compare whole cold requests too."""
+    meta = {"run_id": "r", "model": "A/B", "gpu": "H100", "datacenter": "US-CA-2", "cold_trials": 2,
+            "warm_per_cold": 0, "parallel": True, "evict_page_cache": True, "strategies": ["volumecache", "modelstore"]}
+    trials = [trial("volumecache", "cold", 25, acquire=2), trial("volumecache", "cold", 99, acquire=2),
+              trial("modelstore", "cold", 70, acquire=0), trial("modelstore", "cold", 80, acquire=0)]
+    trials[0]["delay_ms"], trials[1]["delay_ms"] = 14000, 90000
+    trials[2]["delay_ms"], trials[3]["delay_ms"] = 59000, 66000
+    md = report.render(meta, trials)
+    assert "## Overall cold request" in md
+    section = md.split("## Overall cold request")[1].split("\n## ")[0]
+    assert "| volumecache | 62.0s [25.0–99.0] | 52.0s [14.0–90.0] |" in section
+    assert "| 25.0s | 14.0s |" in section          # best case: min e2e, min delay
+    assert section.index("| volumecache |") < section.index("| modelstore |")   # ranked by best case
+
+
+def test_combined_run_sums_usage_of_its_source_runs(tmp_path):
+    runs = tmp_path / "runs"
+    base = {"model": "A/B", "gpu": "H100", "datacenter": "US-CA-2", "cold_trials": 1, "warm_per_cold": 0,
+            "parallel": True, "evict_page_cache": True, "strategies": ["nocache"]}
+    for rid, (start, end, eid, ms) in {"main": (0.0, 600.0, "e1", 60_000), "topup": (1000.0, 1300.0, "e2", 30_000)}.items():
+        d = runs / rid
+        d.mkdir(parents=True)
+        (d / "meta.json").write_text(json.dumps({**base, "run_id": rid, "started_at": start, "finished_at": end,
+                                                 "endpoints": {"nocache": eid}}))
+        (d / "results.jsonl").write_text(json.dumps(trial("nocache", "cold", 30, acquire=10)))
+        (d / "billing.json").write_text(json.dumps([{"endpointId": eid, "timeBilledMs": ms, "amount": 0.1}]))
+    comb = runs / "comb"
+    comb.mkdir()
+    (comb / "meta.json").write_text(json.dumps({**base, "run_id": "comb", "started_at": 0.0, "finished_at": 600.0,
+                                                "endpoints": {"nocache": "e1"}, "combined_from": ["main", "topup"]}))
+    (comb / "results.jsonl").write_text(json.dumps(trial("nocache", "cold", 30, acquire=10)))
+    md = open(report.write(str(comb))).read()
+    u = json.loads((comb / "summary.json").read_text())["usage"]
+    assert u["wall_clock_min"] == pytest.approx(15.0) and u["billed_gpu_min"] == pytest.approx(1.5)
+    assert u["billed_usd"] == pytest.approx(0.2) and sorted(u["runs"]) == ["main", "topup"]
+    assert "combined from `main`, `topup` (sums over those runs)" in md

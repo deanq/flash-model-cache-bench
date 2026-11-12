@@ -222,6 +222,7 @@ def render(meta: dict, trials: list[dict]) -> str:
               "in-place strategies (`volume`, `globalstore`, `modelstore`), the hydrate or prefetch otherwise.",
               ""]
 
+    lines += _overall_lines(summary, strategies)
     lines += ["## Warm requests (model already in GPU memory)", "",
               "| strategy | warm request e2e | tokens/s | n |", "|---|---|---|---|"]
     for s in strategies:
@@ -265,6 +266,25 @@ def _observations(summary: dict, strategies: list[str]) -> list[str]:
                        "FlashBoot restarted the same worker; its process was still fresh (verified per trial).")
     obs += _delay_outliers(summary, strategies)
     return obs or ["- Nothing unusual flagged automatically."]
+
+
+def _overall_lines(summary: dict, strategies: list[str]) -> list[str]:
+    """Whole cold requests, ranked by best case. Storage time alone hides work the
+    platform does before the container starts (Model Store staging/placement lands in
+    delayTime), and capacity waits make medians noisy; the minimum approximates a cold
+    start with no capacity wait."""
+    ranked = sorted((s for s in strategies if summary[s]["cold_e2e"].n), key=lambda s: summary[s]["cold_e2e"].lo)
+    lines = ["## Overall cold request (what a client waits for)", "",
+             "| strategy | cold request e2e | platform delay | handler exec | best-case e2e | best-case delay | n |",
+             "|---|---|---|---|---|---|---|"]
+    for s in ranked:
+        x = summary[s]
+        lines.append(f"| {s} | {x['cold_e2e'].fmt()} | {x['cold_delay'].fmt()} | {x['cold_exec'].fmt()} | "
+                     f"{x['cold_e2e'].lo:.1f}s | {x['cold_delay'].lo:.1f}s | {x['cold_n']} |")
+    return lines + ["", "Medians [min–max]; ranked by best case (minimum), which approximates a cold start "
+                    "without a GPU-capacity wait. Platform delay includes everything before the handler runs — "
+                    "queueing, worker start, and for `modelstore` the platform staging the model or placing the "
+                    "worker on a host that has it — so compare strategies here, not on storage time alone.", ""]
 
 
 def _delay_outliers(summary: dict, strategies: list[str]) -> list[str]:
@@ -317,7 +337,7 @@ def usage(meta: dict, trials: list[dict], billing: list[dict] | None) -> dict:
     GPU time and cost. Billing rows are filtered to this run's endpoint ids, so other
     workloads in the account never leak in."""
     started, finished = meta.get("started_at"), meta.get("finished_at")
-    out = {"wall_clock_min": (finished - started) / 60 if started and finished else None,
+    out = {"wall_clock_min": (finished - started) / 60 if started is not None and finished is not None else None,
            "handler_gpu_min": sum((t.get("exec_ms") or 0) for t in trials) / 60000,
            "billed_gpu_min": None, "billed_usd": None, "billed_gpu_min_by_strategy": None}
     if billing is None:
@@ -358,11 +378,45 @@ def _read_json(path: str):
         return json.load(fh)
 
 
+def _run_usage(run_dir: str) -> dict:
+    meta = _read_json(os.path.join(run_dir, "meta.json"))
+    return usage(meta, load_trials(os.path.join(run_dir, "results.jsonl")),
+                 _read_json(os.path.join(run_dir, "billing.json")))
+
+
+def combined_usage(runs_root: str, sources: list[str]) -> dict:
+    """Sum of the source runs' usage (a combined run is trials merged from several
+    deployments, e.g. a main run plus a top-up). Billed fields stay None while any
+    source is not yet billed."""
+    per = {src: _run_usage(os.path.join(runs_root, src)) for src in sources}
+
+    def total(key):
+        vals = [u[key] for u in per.values()]
+        return None if any(v is None for v in vals) else sum(vals)
+
+    by_strategy: dict[str, float] = {}
+    for u in per.values():
+        for s, m in (u["billed_gpu_min_by_strategy"] or {}).items():
+            by_strategy[s] = by_strategy.get(s, 0.0) + m
+    return {"wall_clock_min": total("wall_clock_min"), "handler_gpu_min": total("handler_gpu_min"),
+            "billed_gpu_min": total("billed_gpu_min"), "billed_usd": total("billed_usd"),
+            "billed_gpu_min_by_strategy": by_strategy or None, "runs": per}
+
+
 def write(run_dir: str) -> str:
     meta = _read_json(os.path.join(run_dir, "meta.json"))
     trials = load_trials(os.path.join(run_dir, "results.jsonl"))
-    run_usage = usage(meta, trials, _read_json(os.path.join(run_dir, "billing.json")))
-    md = render(meta, trials) + "\n".join(_usage_lines(run_usage))
+    sources = meta.get("combined_from")
+    if sources:
+        run_usage = combined_usage(os.path.dirname(os.path.abspath(run_dir)), sources)
+    else:
+        run_usage = usage(meta, trials, _read_json(os.path.join(run_dir, "billing.json")))
+    usage_md = _usage_lines(run_usage)
+    if sources:
+        usage_md.insert(2, "Trials and time/cost combined from " + ", ".join(f"`{s}`" for s in sources) +
+                        " (sums over those runs).")
+        usage_md.insert(3, "")
+    md = render(meta, trials).rstrip("\n") + "\n\n" + "\n".join(usage_md)
     path = os.path.join(run_dir, "report.md")
     with open(path, "w") as fh:
         fh.write(md)
