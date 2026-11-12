@@ -21,9 +21,11 @@ or you press Ctrl-C.
 
 ## Findings
 
-Measured 2026-11-11 on **NVIDIA H100 80GB HBM3** workers (`GPU=ADA_80_PRO`; every trial landed on
-H100 SXM) in `US-CA-2`, with runpod-python 2.2.1, torch 2.9.1+cu128 and transformers 5.22.2. Five
-strategies, **5 valid forced-cold trials each**, page cache evicted before every storage read.
+Measured on **NVIDIA H100 80GB HBM3** workers (`GPU=ADA_80_PRO`; every trial landed on H100 SXM) in
+`US-CA-2`, with runpod-python 2.2.1, torch 2.9.1+cu128 and transformers 5.22.2. Eight strategies,
+**5 valid forced-cold trials each**, page cache evicted before every storage read. The network-volume,
+Model Store and download strategies ran 2026-11-11; the three Global Store strategies ran 2026-11-12
+on the same setup (see caveats for the drift check).
 Medians unless noted; ranges and raw data are in [`results/`](results/).
 
 ### Time the storage strategy controls (get the bytes + load them to GPU)
@@ -35,6 +37,9 @@ Medians unless noted; ranges and raw data are in [`results/`](results/).
 | `volumeprefetch`: same files, parallel page-cache prefetch, then load in place | 7.0s (2.8 + 4.3) | 12.5s (5.1 + 6.1) | 2107 / 2840 MiB/s |
 | `volumecache`: hydrate to container disk + local load | 6.6s (2.0 + 3.7) | **8.6s** (2.6 + 5.4) | 2999 / 5624 MiB/s |
 | `modelstore`: load from Runpod cached model | **5.9s** | 9.7s | 1044 / 1535 MiB/s |
+| `globalstore`: load directly from Global Store | 50.2s | 124.1s | 122 / 119 MiB/s |
+| `gsvolumecache`: VolumeCache hydrate from Global Store + local load | 26.8s (22.9 + 3.5) | 47.4s (41.2 + 5.4) | 258 / 353 MiB/s |
+| `gshydrate`: 64 parallel 8 MiB range reads from Global Store + local load | 26.4s (22.3 + 3.6) | 48.5s (42.4 + 5.4) | 265 / 343 MiB/s |
 
 ### Whole cold request, as a client sees it
 
@@ -50,6 +55,12 @@ no capacity wait:
 | `volume` | 32.5s / 46.2s | 11.4s / 9.5s | **34.8s** / 104.8s |
 | `nocache` | 33.6s / 51.5s | 12.6s / 9.9s | 114.0s / 58.9s |
 | `modelstore` | 70.5s / 95.1s | **58.8s / 80.3s** | 83.2s / 107.0s |
+| `gshydrate` | 40.0s / 106.4s | 12.8s / 53.6s | 89.1s / 160.9s |
+| `gsvolumecache` | 45.6s / 107.0s | 13.5s / 55.3s | 85.0s / 177.3s |
+| `globalstore` | 73.5s / 110.9s | 29.4s / 17.0s | 103.8s / 245.3s |
+
+The Global Store rows come from a day with tighter H100 capacity (waits up to 19 minutes), so their
+platform delay is less comparable than their storage time above.
 
 ### What this means
 
@@ -71,24 +82,39 @@ no capacity wait:
 4. **A network volume clearly beats a fresh download only with a fast reader.** Plain in-place
    loading was on par with downloading from Hugging Face for 3B (16.2 vs 16.7s) and ahead for 7B
    (26.6 vs 39.7s); prefetched or hydrated, it was 2.4–4.6× faster than the download.
-5. **Once the model is in VRAM, storage doesn't matter.** Warm medians were 66–71 tokens/s (3B) and
-   85–89 tokens/s (7B) across strategies.
+5. **Global Store is the slowest place to keep a model, slower than downloading it.** Loading in
+   place read it at ~120 MiB/s (3B 50s, 7B 124s). Parallel reads, either VolumeCache's hydrate or 64
+   concurrent 8 MiB range reads, roughly doubled that to 260–350 MiB/s, but storage time (26–27s
+   for 3B, 47–49s for 7B) was still behind a fresh Hugging Face download (16.7s / 39.7s) and 4–6×
+   behind the network-volume caches. On a network volume the reader was the bottleneck; on Global
+   Store the storage is.
+6. **Once the model is in VRAM, storage doesn't matter.** Warm medians were 66–72 tokens/s (3B) and
+   84–89 tokens/s (7B) across strategies.
 
 Caveats:
 
 - H100 capacity in `US-CA-2` was tight. Four cold trials got no worker within the 20-minute trial
   timeout; those strategies (`volume`, `volumeprefetch`, `modelstore` on 3B) got their fifth trial
   from a top-up run with the same GPU, datacenter and code, merged into the 3B report.
-- A100s were not usable on the same day: A100 workers in `EU-RO-1` waited up to 21 minutes, and a
+- The Global Store strategies ran a day later. That run re-ran `volumecache` as a drift check: median
+  storage 6.1s (3B) and 9.1s (7B) against 6.6s and 8.6s on 2026-11-11. Its re-run trials are left out
+  of the tables, and each report's header records the merge.
+- A100s were not usable on 2026-11-11: A100 workers in `EU-RO-1` waited up to 21 minutes, and a
   probe of A100/H100 in `EU-RO-1`, `US-IL-1` and `US-CA-2` got workers only for H100 in `US-CA-2`.
 - Exact seconds vary with datacenter, host and time of day. Compare strategies within a run.
 
 Full reports: [`results/h100-qwen3b/report.md`](results/h100-qwen3b/report.md) ·
 [`results/h100-qwen7b/report.md`](results/h100-qwen7b/report.md).
 
-Cost: the 3B run (main + top-up) took 109.5 min wall clock and **29.4 billed GPU-minutes ($2.64)**;
-the 7B run took 33.1 min and **25.8 billed GPU-minutes ($2.32)**. Billed time is about 2× the summed
-handler time, because worker start-up is billed too.
+Cost:
+
+| model | 2026-11-11 run | 2026-11-12 Global Store run | total |
+|---|---|---|---|
+| 3B | 109.5 min, 29.4 GPU-min ($2.64) | 72.9 min, 29.2 GPU-min ($2.62) | **182.4 min, 58.5 GPU-min ($5.26)** |
+| 7B | 33.1 min, 25.8 GPU-min ($2.32) | 117.0 min, 39.9 GPU-min ($3.58) | **150.1 min, 65.6 GPU-min ($5.90)** |
+
+Each cell is wall clock and billed GPU time; the 3B 2026-11-11 run includes its top-up. Billed time is
+1.4–2.6× the summed handler time, because worker start-up is billed too.
 
 ---
 
