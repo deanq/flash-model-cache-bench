@@ -191,7 +191,10 @@ def render(meta: dict, trials: list[dict]) -> str:
               f"- **Trials:** {meta['cold_trials']} forced-cold per strategy, {meta['warm_per_cold']} warm after each; "
               f"strategies run {'concurrently in waves' if meta['parallel'] else 'one at a time'}; "
               f"page cache evicted before storage reads: {'yes' if meta['evict_page_cache'] else 'no'}",
-              f"- **Versions:** " + ", ".join(f"{k} {v}" for k, v in (env.get("versions") or {}).items() if v), ""]
+              f"- **Versions:** " + ", ".join(f"{k} {v}" for k, v in (env.get("versions") or {}).items() if v)]
+    if meta.get("combined_note"):
+        lines.append(f"- **Combined:** {meta['combined_note']}")
+    lines.append("")
 
     order = ranking(summary)
     lines += ["## Answer", ""]

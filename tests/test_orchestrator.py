@@ -513,3 +513,19 @@ def test_combined_run_sums_usage_of_its_source_runs(tmp_path):
     assert u["wall_clock_min"] == pytest.approx(15.0) and u["billed_gpu_min"] == pytest.approx(1.5)
     assert u["billed_usd"] == pytest.approx(0.2) and sorted(u["runs"]) == ["main", "topup"]
     assert "combined from `main`, `topup` (sums over those runs)" in md
+
+
+def test_render_shows_combined_note_in_header():
+    """Merged runs measured on different days must say so where readers look first."""
+    meta = {"run_id": "r", "model": "A/B", "gpu": "H100", "datacenter": "US-CA-2", "cold_trials": 1,
+            "warm_per_cold": 0, "parallel": True, "evict_page_cache": True, "strategies": ["volumecache"],
+            "combined_note": "Global Store rows measured 2026-11-12"}
+    md = report.render(meta, [trial("volumecache", "cold", 25, acquire=2)])
+    header = md.split("## Answer")[0]
+    assert "- **Combined:** Global Store rows measured 2026-11-12" in header
+
+
+def test_render_omits_combined_line_for_single_runs():
+    meta = {"run_id": "r", "model": "A/B", "gpu": "H100", "datacenter": "US-CA-2", "cold_trials": 1,
+            "warm_per_cold": 0, "parallel": True, "evict_page_cache": True, "strategies": ["volumecache"]}
+    assert "**Combined:**" not in report.render(meta, [trial("volumecache", "cold", 25, acquire=2)])
