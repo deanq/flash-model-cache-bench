@@ -1,0 +1,91 @@
+{
+  "run_id": "h100-qwen3b-1111-combined",
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "gpu": "ADA_80_PRO",
+  "datacenter": "US-CA-2",
+  "volume_gb": 50,
+  "strategies": [
+    "nocache",
+    "volume",
+    "volumecache",
+    "volumeprefetch",
+    "modelstore"
+  ],
+  "cold_trials": 5,
+  "warm_per_cold": 2,
+  "max_new_tokens": 128,
+  "parallel": true,
+  "evict_page_cache": true,
+  "prime_timeout_s": 2700,
+  "trial_timeout_s": 1200,
+  "keep": false,
+  "started_at": 1794422711.291073,
+  "endpoints": {
+    "volumeprefetch": "5uiglaa8vaw1wg",
+    "volume": "fbo38vkep4aneg",
+    "volumecache": "nk0du31yhtu593",
+    "nocache": "u2038g60iysj89",
+    "modelstore": "v85w0hlq7e348z"
+  },
+  "app": "hfbench-h100-qwen3b-1111",
+  "volume_id": "c0a8ta1n82",
+  "global_store_id": null,
+  "attachments": {
+    "volumeprefetch": {
+      "modelReferences": [],
+      "networkVolumeId": "c0a8ta1n82",
+      "volumes": [
+        {
+          "volumeId": "c0a8ta1n82",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "volume": {
+      "modelReferences": [],
+      "networkVolumeId": "c0a8ta1n82",
+      "volumes": [
+        {
+          "volumeId": "c0a8ta1n82",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "volumecache": {
+      "modelReferences": [],
+      "networkVolumeId": "c0a8ta1n82",
+      "volumes": [
+        {
+          "volumeId": "c0a8ta1n82",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "nocache": {
+      "modelReferences": [],
+      "networkVolumeId": null,
+      "volumes": [],
+      "executionTimeoutMs": 1800000
+    },
+    "modelstore": {
+      "modelReferences": [
+        "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct:aa8e72537993ba99e69dfaafa59ed015b17504d1"
+      ],
+      "networkVolumeId": null,
+      "volumes": [],
+      "executionTimeoutMs": 1800000
+    }
+  },
+  "finished_at": 1794427734.511724,
+  "combined_from": [
+    "h100-qwen3b-1111",
+    "h100-qwen3b-1111-topup"
+  ],
+  "combined_note": "top-up cold/warm trials renumbered r6+; its prime excluded (main run's prime is the first-ever request)"
+}

@@ -1,0 +1,87 @@
+{
+  "run_id": "h100-qwen7b-1111",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "gpu": "ADA_80_PRO",
+  "datacenter": "US-CA-2",
+  "volume_gb": 60,
+  "strategies": [
+    "nocache",
+    "volume",
+    "volumecache",
+    "volumeprefetch",
+    "modelstore"
+  ],
+  "cold_trials": 5,
+  "makeup_rounds": 3,
+  "warm_per_cold": 2,
+  "max_new_tokens": 128,
+  "parallel": true,
+  "evict_page_cache": true,
+  "prime_timeout_s": 2700,
+  "trial_timeout_s": 1200,
+  "keep": false,
+  "started_at": 1794427745.614182,
+  "endpoints": {
+    "nocache": "3fqcapqdrn8ek4",
+    "volumeprefetch": "oo7qkznv40k10o",
+    "volume": "ow9o27mjikzezp",
+    "volumecache": "soocp9pojfq8ig",
+    "modelstore": "tnlv9gliawk2d1"
+  },
+  "app": "hfbench-h100-qwen7b-1111",
+  "volume_id": "wy0vyquaym",
+  "global_store_id": null,
+  "attachments": {
+    "nocache": {
+      "modelReferences": [],
+      "networkVolumeId": null,
+      "volumes": [],
+      "executionTimeoutMs": 1800000
+    },
+    "volumeprefetch": {
+      "modelReferences": [],
+      "networkVolumeId": "wy0vyquaym",
+      "volumes": [
+        {
+          "volumeId": "wy0vyquaym",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "volume": {
+      "modelReferences": [],
+      "networkVolumeId": "wy0vyquaym",
+      "volumes": [
+        {
+          "volumeId": "wy0vyquaym",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "volumecache": {
+      "modelReferences": [],
+      "networkVolumeId": "wy0vyquaym",
+      "volumes": [
+        {
+          "volumeId": "wy0vyquaym",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "modelstore": {
+      "modelReferences": [
+        "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct:a09a35458c702b33eeacc393d103063234e8bc28"
+      ],
+      "networkVolumeId": null,
+      "volumes": [],
+      "executionTimeoutMs": 1800000
+    }
+  },
+  "finished_at": 1794429734.505693
+}
