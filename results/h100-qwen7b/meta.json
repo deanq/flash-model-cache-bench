@@ -1,5 +1,5 @@
 {
-  "run_id": "h100-qwen7b-1111",
+  "run_id": "h100-qwen7b-all",
   "model": "Qwen/Qwen2.5-7B-Instruct",
   "gpu": "ADA_80_PRO",
   "datacenter": "US-CA-2",
@@ -9,7 +9,10 @@
     "volume",
     "volumecache",
     "volumeprefetch",
-    "modelstore"
+    "modelstore",
+    "globalstore",
+    "gsvolumecache",
+    "gshydrate"
   ],
   "cold_trials": 5,
   "makeup_rounds": 3,
@@ -26,11 +29,14 @@
     "volumeprefetch": "oo7qkznv40k10o",
     "volume": "ow9o27mjikzezp",
     "volumecache": "soocp9pojfq8ig",
-    "modelstore": "tnlv9gliawk2d1"
+    "modelstore": "tnlv9gliawk2d1",
+    "gsvolumecache": "931ecteoj180ns",
+    "globalstore": "wy2w0lcqst49iw",
+    "gshydrate": "x21us1opju1e0l"
   },
   "app": "hfbench-h100-qwen7b-1111",
   "volume_id": "wy0vyquaym",
-  "global_store_id": null,
+  "global_store_id": "cmwdfui8w000007l4h9koe94r",
   "attachments": {
     "nocache": {
       "modelReferences": [],
@@ -83,5 +89,23 @@
       "executionTimeoutMs": 1800000
     }
   },
-  "finished_at": 1794429734.505693
+  "finished_at": 1794429734.505693,
+  "combined_from": [
+    "h100-qwen7b-1111",
+    "h100gs-qwen7b-1112"
+  ],
+  "combined_note": "`globalstore`, `gsvolumecache`, `gshydrate` measured 2026-11-12 in run `h100gs-qwen7b-1112`; the rest measured 2026-11-11. Drift check: `volumecache` re-run alongside Global Store had median storage 9.1s / cold e2e 196.3s (n=5) vs 8.6s / 30.3s (n=5) here; its re-run rows are excluded from the tables.",
+  "drift_check": {
+    "strategy": "volumecache",
+    "base": {
+      "storage_s": 8.624274228932336,
+      "cold_e2e_s": 30.30570845771581,
+      "n": 5
+    },
+    "global_store_run": {
+      "storage_s": 9.05267643276602,
+      "cold_e2e_s": 196.25439491588622,
+      "n": 5
+    }
+  }
 }

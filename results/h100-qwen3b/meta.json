@@ -1,5 +1,5 @@
 {
-  "run_id": "h100-qwen3b-1111-combined",
+  "run_id": "h100-qwen3b-all",
   "model": "Qwen/Qwen2.5-3B-Instruct",
   "gpu": "ADA_80_PRO",
   "datacenter": "US-CA-2",
@@ -9,7 +9,10 @@
     "volume",
     "volumecache",
     "volumeprefetch",
-    "modelstore"
+    "modelstore",
+    "globalstore",
+    "gsvolumecache",
+    "gshydrate"
   ],
   "cold_trials": 5,
   "warm_per_cold": 2,
@@ -25,11 +28,14 @@
     "volume": "fbo38vkep4aneg",
     "volumecache": "nk0du31yhtu593",
     "nocache": "u2038g60iysj89",
-    "modelstore": "v85w0hlq7e348z"
+    "modelstore": "v85w0hlq7e348z",
+    "gshydrate": "sw3hbcy2wpccfa",
+    "gsvolumecache": "x2scdd4zlqpb2e",
+    "globalstore": "xjn72r43rq8289"
   },
   "app": "hfbench-h100-qwen3b-1111",
   "volume_id": "c0a8ta1n82",
-  "global_store_id": null,
+  "global_store_id": "cmwdd89kt000007jpgba30601",
   "attachments": {
     "volumeprefetch": {
       "modelReferences": [],
@@ -85,7 +91,21 @@
   "finished_at": 1794427734.511724,
   "combined_from": [
     "h100-qwen3b-1111",
-    "h100-qwen3b-1111-topup"
+    "h100-qwen3b-1111-topup",
+    "h100gs-qwen3b-1112"
   ],
-  "combined_note": "top-up cold/warm trials renumbered r6+; its prime excluded (main run's prime is the first-ever request)"
+  "combined_note": "top-up cold/warm trials renumbered r6+; its prime excluded (main run's prime is the first-ever request). `globalstore`, `gsvolumecache`, `gshydrate` measured 2026-11-12 in run `h100gs-qwen3b-1112`; the rest measured 2026-11-11. Drift check: `volumecache` re-run alongside Global Store had median storage 6.1s / cold e2e 24.8s (n=5) vs 6.6s / 109.7s (n=5) here; its re-run rows are excluded from the tables.",
+  "drift_check": {
+    "strategy": "volumecache",
+    "base": {
+      "storage_s": 6.5882760640233755,
+      "cold_e2e_s": 109.67821195814759,
+      "n": 5
+    },
+    "global_store_run": {
+      "storage_s": 6.091238799970597,
+      "cold_e2e_s": 24.806930917315185,
+      "n": 5
+    }
+  }
 }
