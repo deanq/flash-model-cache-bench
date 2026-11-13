@@ -22,12 +22,19 @@ def _versions() -> dict:
     from importlib.metadata import PackageNotFoundError, version
 
     out = {}
-    for dist in ("torch", "transformers", "huggingface_hub", "hf_xet", "runpod", "accelerate", "safetensors"):
+    for dist in ("torch", "transformers", "huggingface_hub", "hf_xet", "accelerate", "safetensors"):
         try:
             out[dist] = version(dist)
         except PackageNotFoundError:
             out[dist] = None
-    out["runpod_code"] = strategies.runpod_code_version()   # the vendored tree; "runpod" is image metadata
+    import runpod
+    # runpod>=2.2.1 (#708) reports the imported tree, i.e. the deploy artifact's vendored
+    # runpod; dist metadata can still be the worker image's install (2.2.0 on some hosts).
+    out["runpod"] = runpod.__version__
+    try:
+        out["runpod_dist"] = version("runpod")
+    except PackageNotFoundError:
+        out["runpod_dist"] = None
     return out
 
 

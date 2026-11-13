@@ -236,21 +236,10 @@ def prefetch_files(paths: list[str], *, workers: int, chunk_bytes: int) -> dict:
 def load_volumecache_class():
     """The runpod SDK's VolumeCache. `rp flash deploy` vendors the deploying client's
     runpod package (>= 2.1.0) into the artifact, so the worker always has it."""
+    import runpod
     from runpod.serverless import VolumeCache
 
-    return VolumeCache, f"runpod-{runpod_code_version()}"
-
-
-def runpod_code_version() -> str:
-    """Version of the runpod code actually imported. `runpod.__version__` reads the
-    installed dist metadata, which on a Flash worker is the image's runpod (2.0.0 on
-    the 2026-11 images) even though the artifact's vendored 2.1.0 tree is what runs."""
-    try:
-        from runpod._version import __version__
-        return __version__
-    except ImportError:
-        import runpod
-        return f"{runpod.__version__}(metadata)"
+    return VolumeCache, f"runpod-{runpod.__version__}"   # the imported tree since runpod 2.2.1 (#708)
 
 
 def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: str,

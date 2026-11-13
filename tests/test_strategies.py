@@ -366,3 +366,16 @@ def test_cgroup_memory_limit_reads_v2_and_reports_unlimited_or_missing(tmp_path)
     f.write_text("max\n")
     assert st.cgroup_memory_limit(str(f)) == "max"
     assert st.cgroup_memory_limit(str(tmp_path / "absent")) is None
+
+
+def test_versions_report_the_imported_runpod_tree_and_the_image_dist():
+    """runpod>=2.2.1 (#708): runpod.__version__ is the imported (vendored) tree; dist
+    metadata can still be the worker image's runpod, so it is reported separately."""
+    from importlib.metadata import version
+
+    import runpod
+    import runtime
+
+    v = runtime._versions()
+    assert v["runpod"] == runpod.__version__ and v["runpod_dist"] == version("runpod")
+    assert "runpod_code" not in v
