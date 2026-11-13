@@ -223,6 +223,55 @@ runpod 2.2.1 keeps the 64 × 8 MiB default, yet on H100 workers in `US-CA-2` (ab
 at ~3.0 GiB/s (3B) and ~5.6 GiB/s (7B). The 2.1.0 slowdown therefore depends on the host and volume
 cluster, not only on the default.
 
+### 2026-11-13: runpod 2.2.1, VolumeCache default vs explicit 8 × 64 MiB (RTX 4090, `EU-RO-1`)
+
+Same small setup as the 2.1.0 re-run (3B, 3 cold trials, RTX 4090, `EU-RO-1`) on runpod 2.2.1, plus
+`volumecache864`: the same VolumeCache mirror hydrated with `hydrate_workers=8,
+hydrate_chunk_size=64 MiB`, the network-volume default on runpod-python main (#691, not in 2.2.1).
+Stock `volumecache` still measures the SDK default (64 × 8 MiB in 2.2.1), so one run shows the
+released default and the next release side by side
+([`results/qwen3b-rp221`](results/qwen3b-rp221/report.md)). Median storage time (acquire + load):
+
+| strategy | 2026-11-03 (runpod 2.1.0) | 2026-11-13 (runpod 2.2.1) |
+|---|---|---|
+| `nocache` | 12.0s | 13.2s |
+| `volume` | 21.2s | 17.8s |
+| `volumecache` (SDK default, 64 × 8 MiB) | 23.1s (17.8 + 4.2) | **16.8s** (13.1 hydrate + 3.1 load) |
+| `volumecache864` (8 × 64 MiB) | – | 17.3s (12.7 hydrate + 3.9 load) |
+| `globalstore`, `gshydrate` | 36.6s, 15.0s | not run |
+
+Per-trial hydrate of the same 5.8 GiB mirror, page cache evicted first, the two variants never in
+the same wave:
+
+| | trial 1 | trial 2 | trial 3 |
+|---|---|---|---|
+| `volumecache` (64 × 8 MiB) | 12.8s | 13.1s | 20.7s |
+| `volumecache864` (8 × 64 MiB) | 12.7s | **5.2s** | 14.0s |
+
+**On this run, 8 × 64 MiB was not a reliable win.** It hydrated at ~1.1 GiB/s on one worker out of
+three (matching the 2.1.0 microbenchmark) and at ~420–470 MiB/s on the other two, the same rate as
+the default (285–462 MiB/s). That rate is close to the ~460 MiB/s of a plain sequential copy
+measured on 2.1.0. A per-host volume read ceiling seems to cap most workers whatever the hydrate
+settings. Three trials per variant can't separate them. The fast trials (here, and the H100 run
+above) come from the host, not from the settings.
+
+Also checked on 2.2.1:
+
+- **Workers report the code that runs (#708).** `runpod.__version__` was 2.2.1 on every worker, so
+  the harness dropped its `runpod._version` shim (`versions.runpod_code`). It now records
+  `versions.runpod` (imported tree) and `versions.runpod_dist` (installed dist metadata, which can be
+  the worker image's runpod). In this run both were 2.2.1 on every worker. The H100 runs above had
+  2.2.0 metadata on some hosts.
+- **Templates have unique names (#696)**, e.g. `hfbench-rp221-1113-hfbench-volume-template-4228d6`.
+  All four outlived teardown. After the app, endpoints and volume were gone, the REST template list
+  still showed the four `hfbench-rp221-1113-hfbench-{nocache,volume,volumecache,volumecache864}-template-4228d6`
+  templates, and `DELETE /v1/templates/<id>` answered `500 template not found`. That fits #696's
+  note that the platform removes a deleted endpoint's template later. With unique names, they no
+  longer block a redeploy.
+- No failures: 12/12 cold and 24/24 warm trials completed. Two cold trials (round 3 of `volume` and
+  `volumecache`) waited ~100s for a worker. That is a platform capacity wait, inside `delayTime`, and
+  it doesn't affect the storage times.
+
 ---
 
 ## Reproduce it yourself
@@ -292,7 +341,7 @@ Set them in `.env` or on the command line (`make run MODEL=... COLD_TRIALS=5`).
 | `GPU` | `ADA_24` | `runpod.GpuGroup`/`GpuType` name(s) or shorthands, comma-separated (e.g. `AMPERE_48`, `4090`) |
 | `DATACENTER` | `EU-RO-1` | must support network volumes |
 | `VOLUME_GB` | `50` | needs ≈ 2.2 × model size (volume copy + VolumeCache mirror) |
-| `STRATEGIES` | all eight | comma-separated subset of `nocache,volume,volumecache,modelstore,globalstore,gsvolumecache,gshydrate,volumeprefetch`; only these are deployed |
+| `STRATEGIES` | all eight | comma-separated subset of `nocache,volume,volumecache,modelstore,globalstore,gsvolumecache,gshydrate,volumeprefetch`, plus the optional `volumecache864`; only these are deployed |
 | `COLD_TRIALS` | `3` | forced-cold requests per strategy |
 | `MAKEUP_ROUNDS` | `3` | extra rounds, only for strategies short of `COLD_TRIALS` valid cold trials (e.g. no worker within the trial timeout) |
 | `WARM_PER_COLD` | `2` | warm requests after each cold one |
@@ -347,6 +396,7 @@ the same datacenter. Only where the model bytes come from differs.
 | `gsvolumecache` | like `volumecache`, but the mirror lives on the global volume |
 | `gshydrate` | the `globalstore` folder, copied to container disk with 64 concurrent 8 MiB range reads, then loaded locally |
 | `volumeprefetch` | the `volume` HF cache, read once into the page cache with 8 concurrent 64 MiB range reads, then loaded straight from the mount (pages come from RAM) |
+| `volumecache864` (optional, not in the default set) | `volumecache` with explicit `hydrate_workers=8, hydrate_chunk_size=64 MiB`; shares its mirror |
 
 A global volume and a network volume can't be attached to the same endpoint, so the
 Global Store strategies get their own endpoints. Global volumes don't tie an endpoint to a
@@ -436,8 +486,10 @@ Status with runpod 2.1.0–2.2.1 (the harness was first built on standalone `run
 - **`runpod.__version__` on a worker reports the image's runpod (2.0.0), not the code that runs.**
   The artifact overlays the client's 2.1.0 package tree without its dist metadata, and `__version__`
   reads the metadata. The harness records `runpod._version` as `versions.runpod_code`.
+  Fixed in 2.2.1 (#708); see the 2026-11-13 section.
 - **VolumeCache's default hydrate (64 × 8 MiB ranges) is ~3× slower than 8 × 64 MiB on a network
   volume.** See "Re-run on runpod 2.1.0" above.
+  The 8 × 64 MiB default is on runpod-python main (#691), not in 2.2.1; `volumecache864` measures it.
 - **`runpod.GpuType` has no L40 or L40S, and `GpuGroup.ADA_48_PRO` maps only to the RTX 6000 Ada**
   (2.2.1), so the SDK can't target L40S, a common datacenter card.
 - **Flash endpoints still put your `RUNPOD_API_KEY` in the endpoint's environment,** where anyone

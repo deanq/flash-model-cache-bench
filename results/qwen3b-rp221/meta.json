@@ -1,0 +1,77 @@
+{
+  "run_id": "rp221-1113",
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "gpu": "ADA_24",
+  "datacenter": "EU-RO-1",
+  "volume_gb": 50,
+  "strategies": [
+    "nocache",
+    "volume",
+    "volumecache",
+    "volumecache864"
+  ],
+  "cold_trials": 3,
+  "makeup_rounds": 1,
+  "warm_per_cold": 2,
+  "max_new_tokens": 128,
+  "parallel": true,
+  "evict_page_cache": true,
+  "prime_timeout_s": 2700,
+  "trial_timeout_s": 1200,
+  "keep": false,
+  "started_at": 1794557324.1706629,
+  "endpoints": {
+    "nocache": "0ftox1p3rylhui",
+    "volumecache864": "g013oor5pp7plu",
+    "volume": "nx15cya9phk14j",
+    "volumecache": "theeuw7qsllobq"
+  },
+  "app": "hfbench-rp221-1113",
+  "volume_id": "1eda4sapxq",
+  "global_store_id": null,
+  "attachments": {
+    "nocache": {
+      "modelReferences": [],
+      "networkVolumeId": null,
+      "volumes": [],
+      "executionTimeoutMs": 1800000
+    },
+    "volumecache864": {
+      "modelReferences": [],
+      "networkVolumeId": "1eda4sapxq",
+      "volumes": [
+        {
+          "volumeId": "1eda4sapxq",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "volume": {
+      "modelReferences": [],
+      "networkVolumeId": "1eda4sapxq",
+      "volumes": [
+        {
+          "volumeId": "1eda4sapxq",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    },
+    "volumecache": {
+      "modelReferences": [],
+      "networkVolumeId": "1eda4sapxq",
+      "volumes": [
+        {
+          "volumeId": "1eda4sapxq",
+          "volumeType": "NETWORK_VOLUME",
+          "mountPath": "/runpod-volume"
+        }
+      ],
+      "executionTimeoutMs": 1800000
+    }
+  },
+  "finished_at": 1794558361.855069
+}
