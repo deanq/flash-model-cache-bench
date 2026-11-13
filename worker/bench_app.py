@@ -22,6 +22,7 @@ import runtime
 ENDPOINT_PREFIX = "hfbench-"
 ALL_STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate",
                   "volumeprefetch", "volumecache864")
+DEFAULT_STRATEGIES = tuple(s for s in ALL_STRATEGIES if s != "volumecache864")   # 864 is opt-in
 NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache", "volumeprefetch", "volumecache864")
 GLOBAL_STORE_STRATEGIES = ("globalstore", "gsvolumecache", "gshydrate")
 DEPENDENCIES = ["transformers>=4.56", "accelerate>=1.0", "safetensors"]
@@ -35,7 +36,7 @@ GLOBAL_STORE_NAME = os.environ.get("BENCH_GLOBAL_STORE_NAME", f"{ENDPOINT_PREFIX
 VOLUME_GB = int(os.environ.get("BENCH_VOLUME_GB", "50"))
 IDLE_TIMEOUT_S = int(os.environ.get("BENCH_IDLE_TIMEOUT_S", "5"))
 EXECUTION_TIMEOUT_MS = 30 * 60 * 1000   # first population downloads the whole model
-SELECTED = tuple(s.strip() for s in os.environ.get("BENCH_STRATEGIES", ",".join(ALL_STRATEGIES)).split(",")
+SELECTED = tuple(s.strip() for s in os.environ.get("BENCH_STRATEGIES", ",".join(DEFAULT_STRATEGIES)).split(",")
                  if s.strip())
 
 app = App(APP_NAME)

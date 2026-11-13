@@ -10,7 +10,8 @@ from bench.runpod_api import RunpodError
 def test_config_defaults_and_empty_values():
     cfg = config.load({"MODEL": "", "COLD_TRIALS": ""}, run_id="r1")
     assert cfg.model == "Qwen/Qwen2.5-3B-Instruct" and cfg.cold_trials == 3
-    assert cfg.strategies == config.STRATEGIES and cfg.volume_name == "hfbench-r1"
+    assert cfg.strategies == config.DEFAULT_STRATEGIES and cfg.volume_name == "hfbench-r1"
+    assert "volumecache864" not in cfg.strategies          # opt-in variant, not part of the default eight
     assert cfg.deploy_env()["BENCH_VOLUME_NAME"] == "hfbench-r1"
 
 

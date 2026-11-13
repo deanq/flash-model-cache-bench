@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 RESOURCE_PREFIX = "hfbench-"   # app, network volume and global store names: hfbench-<run id>
 STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate",
               "volumeprefetch", "volumecache864")
+OPTIONAL_STRATEGIES = ("volumecache864",)          # run only when named in STRATEGIES
+DEFAULT_STRATEGIES = tuple(s for s in STRATEGIES if s not in OPTIONAL_STRATEGIES)
 GLOBAL_STORE_STRATEGIES = ("globalstore", "gsvolumecache", "gshydrate")
 NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache", "volumeprefetch", "volumecache864")
 DATACENTERS = ("US-CA-2", "US-IL-1", "US-KS-2", "US-MO-1", "US-MO-2", "US-NC-2", "US-NE-1", "US-WA-1",
@@ -116,7 +118,7 @@ def load(env=None, *, run_id: str | None = None) -> Config:
     dc = _str(env, "DATACENTER", "EU-RO-1")
     if dc not in DATACENTERS:
         raise ConfigError(f"DATACENTER={dc!r} not one of {DATACENTERS}")
-    strategies = tuple(s.strip() for s in _str(env, "STRATEGIES", ",".join(STRATEGIES)).split(",") if s.strip())
+    strategies = tuple(s.strip() for s in _str(env, "STRATEGIES", ",".join(DEFAULT_STRATEGIES)).split(",") if s.strip())
     unknown = [s for s in strategies if s not in STRATEGIES]
     if unknown or not strategies:
         raise ConfigError(f"STRATEGIES has unknown/empty entries {unknown}; choose from {STRATEGIES}")
