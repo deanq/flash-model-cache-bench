@@ -43,12 +43,13 @@ def _acquire(strategy: str, model_id: str, token: str | None, evict: bool) -> st
         acq = strategies.acquire_volumeprefetch(model_id, token)
         acq.notes["evicted_volume_bytes"] = evicted
         return acq
-    if strategy in ("volumecache", "gsvolumecache"):
+    if strategy in ("volumecache", "gsvolumecache", "volumecache864"):
         # Same code on both backends: runpod>=2.1.0's VolumeCache copies with copyfile
         # and best-effort metadata, so it works on Global Store without a patch.
         namespace = os.environ["BENCH_NAMESPACE"]
         evicted = strategies.evict_page_cache(strategies.volumecache_mirror_files(namespace)) if evict else 0
-        acq = strategies.acquire_volumecache(model_id, token, namespace=namespace)
+        tuned = strategies.VOLUMECACHE_864 if strategy == "volumecache864" else None
+        acq = strategies.acquire_volumecache(model_id, token, namespace=namespace, hydrate_settings=tuned)
         acq.notes["evicted_mirror_bytes"] = evicted
         return acq
     if strategy == "modelstore":

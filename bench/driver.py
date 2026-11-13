@@ -26,7 +26,7 @@ TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
 
 # Strategies that read the same shared storage; members of a group are never
 # measured at the same time so they don't compete for its bandwidth.
-SHARED_STORAGE = (("volume", "volumecache", "volumeprefetch"), ("globalstore", "gsvolumecache", "gshydrate"))
+SHARED_STORAGE = (("volume", "volumecache", "volumeprefetch", "volumecache864"), ("globalstore", "gsvolumecache", "gshydrate"))
 
 
 def waves(strategies: list[str]) -> list[list[str]]:

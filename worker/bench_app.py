@@ -21,8 +21,8 @@ import runtime
 
 ENDPOINT_PREFIX = "hfbench-"
 ALL_STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate",
-                  "volumeprefetch")
-NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache", "volumeprefetch")
+                  "volumeprefetch", "volumecache864")
+NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache", "volumeprefetch", "volumecache864")
 GLOBAL_STORE_STRATEGIES = ("globalstore", "gsvolumecache", "gshydrate")
 DEPENDENCIES = ["transformers>=4.56", "accelerate>=1.0", "safetensors"]
 
@@ -125,3 +125,8 @@ async def hfbench_gshydrate(**payload) -> dict:
 @bench_endpoint("volumeprefetch")
 async def hfbench_volumeprefetch(**payload) -> dict:
     return runtime.handle("volumeprefetch", payload)
+
+
+@bench_endpoint("volumecache864")
+async def hfbench_volumecache864(**payload) -> dict:
+    return runtime.handle("volumecache864", payload)

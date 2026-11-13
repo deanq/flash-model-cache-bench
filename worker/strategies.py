@@ -7,6 +7,9 @@ only in *where the bytes come from*:
 - nocache      fresh download from the Hub into container disk, every cold start
 - volume       HF cache lives on the network volume; load straight off the mount
 - volumecache  HF cache on container disk, mirrored to the volume by VolumeCache
+               (SDK default hydrate settings)
+- volumecache864  same mirror as `volumecache`, hydrated with explicit 8 x 64 MiB
+               range reads (the network-volume default on runpod-python main, #691)
 - modelstore   Runpod cached model, pre-staged by the platform
 - globalstore  Runpod Global Store (object-backed, geesefs) mounted at /runpod-volume;
                load straight off the mount
@@ -39,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate",
-              "volumeprefetch")
+              "volumeprefetch", "volumecache864")
 
 VOLUME_ROOT = "/runpod-volume"
 LOCAL_ROOT = "/opt/hfbench"                       # container disk, outside /root/.cache
@@ -62,6 +65,10 @@ HYDRATE_CHUNK_BYTES = 8 << 20
 # (testbeds-runpod-2.1: 8 x 64 MiB ~1000-1400 MiB/s vs 64 x 8 MiB ~360 MiB/s).
 PREFETCH_WORKERS = 8
 PREFETCH_CHUNK_BYTES = 64 << 20
+# volumecache864: the same tuning passed to VolumeCache explicitly. runpod 2.2.1
+# hydrates with 64 x 8 MiB (tuned for Global Store); main's #691 makes 8 x 64 MiB
+# the network-volume default. Keyword names are VolumeCache's (runpod >= 2.1.0).
+VOLUMECACHE_864 = {"hydrate_workers": PREFETCH_WORKERS, "hydrate_chunk_size": PREFETCH_CHUNK_BYTES}
 HYDRATE_RETRY_ERRNOS = frozenset({5, 11, 12})   # EIO, EAGAIN, ENOMEM: geesefs buffer pool exhausted
 HYDRATE_MAX_ATTEMPTS = 8
 HYDRATE_RETRY_BASE_S = 0.05
@@ -248,9 +255,12 @@ def runpod_code_version() -> str:
 
 def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: str,
                         local_root: str = LOCAL_ROOT, volume_path: str = VOLUME_ROOT,
-                        cache_cls=None) -> Acquired:
+                        cache_cls=None, hydrate_settings: dict | None = None) -> Acquired:
     """HF cache on container disk; VolumeCache hydrates it from the volume mirror before
-    load and (on first population) syncs it back synchronously."""
+    load and (on first population) syncs it back synchronously.
+
+    hydrate_settings (VolumeCache keywords) are passed only when given, so the stock
+    strategy measures whatever default the deployed runpod release ships."""
     impl = "injected"
     if cache_cls is None:
         cache_cls, impl = load_volumecache_class()
@@ -261,7 +271,8 @@ def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: st
     # records how much a real worker would have been able to reuse.
     shutil.rmtree(os.path.join(local_root, "vc"), ignore_errors=True)
     os.makedirs(hub_root, exist_ok=True)
-    vc = cache_cls(dirs=[hub_root], namespace=namespace, volume_path=volume_path, best_effort=False)
+    vc = cache_cls(dirs=[hub_root], namespace=namespace, volume_path=volume_path, best_effort=False,
+                   **(hydrate_settings or {}))
     t: dict[str, float] = {}
     t0 = time.monotonic()
     restored = vc.hydrate()
@@ -284,7 +295,8 @@ def acquire_volumecache(repo_id: str, token: str | None = None, *, namespace: st
                     hub_online="hub_s" in t or "download_s" in t,
                     notes={"impl": impl, "files_hydrated": restored, "hydrated_bytes": hydrated_bytes,
                            "hub_fetched_bytes": fetched, "synced": synced, "leftover_bytes": leftover,
-                           "mirror_bytes_after_sync": mirror_bytes})
+                           "mirror_bytes_after_sync": mirror_bytes,
+                           "hydrate_settings": dict(hydrate_settings) if hydrate_settings else "sdk-default"})
 
 
 def _resolve_or_download_linked(repo_id: str, hub_root: str, token: str | None, t: dict) -> tuple[Path, bool]:

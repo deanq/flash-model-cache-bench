@@ -224,7 +224,9 @@ def test_waves_keep_shared_storage_strategies_apart():
         ["nocache", "volume", "modelstore"], ["volumecache"]]
     assert driver.waves(list(config.STRATEGIES)) == [
         ["nocache", "volume", "modelstore", "globalstore"], ["volumecache", "gsvolumecache"],
-        ["gshydrate", "volumeprefetch"]]
+        ["gshydrate", "volumeprefetch"], ["volumecache864"]]
+    # the two VolumeCache variants share one mirror: never primed or measured together
+    assert driver.waves(["volumecache", "volumecache864"]) == [["volumecache"], ["volumecache864"]]
     assert driver.waves(["volume", "volumeprefetch"]) == [["volume"], ["volumeprefetch"]]
     assert driver.waves(["volumecache", "modelstore"]) == [["volumecache", "modelstore"]]
     assert driver.waves(["gsvolumecache"]) == [["gsvolumecache"]]
@@ -286,6 +288,7 @@ def test_config_knows_global_store_strategies():
     assert config.load({"STRATEGIES": "nocache"}, run_id="r").uses_global_store is False
     cfg = config.load({"STRATEGIES": "globalstore"}, run_id="r")
     assert cfg.uses_global_store and cfg.global_store_name == "hfbench-r"
+    assert config.load({"STRATEGIES": "volumecache864"}, run_id="r").uses_network_volume is True
 
 
 def test_verify_attachments_fails_when_deploy_did_not_attach_storage():
@@ -324,6 +327,7 @@ def test_bench_app_registers_only_selected_strategies_with_their_storage(monkeyp
     assert manifest["hfbench-volumecache"]["mounts"] == [
         {"kind": "network", "reference": "hfbench-t1", "path": "/runpod-volume"}]
     assert manifest["hfbench-volumeprefetch"]["mounts"] == manifest["hfbench-volumecache"]["mounts"]
+    assert not hasattr(app_mod.hfbench_volumecache864, "spec")
     assert manifest["hfbench-gshydrate"]["mounts"] == [
         {"kind": "global", "reference": "hfbench-t1", "path": "/runpod-volume"}]
     assert "mounts" not in manifest["hfbench-nocache"]
@@ -337,6 +341,15 @@ def test_bench_app_registers_only_selected_strategies_with_their_storage(monkeyp
     assert env["BENCH_APP"] == "hfbench-t1" and env["BENCH_STRATEGIES"] == "nocache,volumecache,modelstore,gshydrate,volumeprefetch"
     # unselected strategies stay plain functions (not deployed); selected ones keep their names
     assert not hasattr(app_mod.hfbench_volume, "spec") and app_mod.hfbench_nocache.spec.name == "hfbench-nocache"
+
+
+def test_bench_app_volumecache864_shares_the_volumecache_mirror(monkeypatch):
+    app_mod = _load_bench_app(monkeypatch, BENCH_RUN_ID="t1", BENCH_APP="hfbench-t1",
+                              BENCH_STRATEGIES="volumecache,volumecache864")
+    manifest = {n: h.spec.to_manifest() for n, h in app_mod.app.resources.items()}
+    assert manifest["hfbench-volumecache864"]["mounts"] == manifest["hfbench-volumecache"]["mounts"]
+    assert (manifest["hfbench-volumecache864"]["env"]["BENCH_NAMESPACE"]
+            == manifest["hfbench-volumecache"]["env"]["BENCH_NAMESPACE"])
 
 
 def test_usage_reports_wall_clock_handler_and_billed_gpu_minutes_for_this_run_only():

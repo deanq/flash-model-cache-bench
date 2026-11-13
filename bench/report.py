@@ -18,14 +18,16 @@ LABELS = {
     "gsvolumecache": "VolumeCache (Global Store -> container disk)",
     "gshydrate": "parallel range hydrate (Global Store -> container disk)",
     "volumeprefetch": "network volume, parallel page-cache prefetch, loaded in place",
+    "volumecache864": "VolumeCache with explicit 8 x 64 MiB hydrate (volume -> container disk)",
 }
 # (in place, VolumeCache, storage name): the question "is loading straight off
 # shared storage slower than copying it to container disk first?" per backend.
 IN_PLACE_VS_CACHED = (("volume", "volumecache", "network volume"),
                       ("volumeprefetch", "volumecache", "network volume (prefetched)"),
+                      ("volume", "volumecache864", "network volume (VolumeCache 8 x 64 MiB)"),
                       ("globalstore", "gsvolumecache", "Global Store"),
                       ("globalstore", "gshydrate", "Global Store (parallel hydrate)"))
-VOLUMECACHE_STRATEGIES = ("volumecache", "gsvolumecache")
+VOLUMECACHE_STRATEGIES = ("volumecache", "gsvolumecache", "volumecache864")
 # Strategies whose model load reads shared storage directly (no up-front copy/prefetch).
 LOAD_READS_SHARED_STORAGE = ("volume", "globalstore", "modelstore")
 MIB = 1024 ** 2
@@ -315,7 +317,7 @@ def _caveats(meta: dict) -> list[str]:
             "- nocache downloads straight from the Hugging Face CDN; its numbers move with CDN/WAN conditions.",
             "- `GPU` names a class, not a machine: hosts in the same class differ (see the warm tokens/s range), "
             "which shows up in import, load and generate times alike.",
-            ("- Cold rounds ran strategies concurrently in waves; strategies sharing storage (`volume`/`volumecache`/`volumeprefetch`, "
+            ("- Cold rounds ran strategies concurrently in waves; strategies sharing storage (`volume`/`volumecache`/`volumeprefetch`/`volumecache864`, "
              "`globalstore`/`gsvolumecache`/`gshydrate`) were never in the same wave. (The prime phase runs all at once.)"
              if meta["parallel"] else "- Strategies ran one at a time (PARALLEL=0)."),
             "- Model Store is declared with `model=runpod.Model(...)` on the endpoint (sets `modelReferences`).",

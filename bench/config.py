@@ -9,9 +9,9 @@ from dataclasses import asdict, dataclass
 
 RESOURCE_PREFIX = "hfbench-"   # app, network volume and global store names: hfbench-<run id>
 STRATEGIES = ("nocache", "volume", "volumecache", "modelstore", "globalstore", "gsvolumecache", "gshydrate",
-              "volumeprefetch")
+              "volumeprefetch", "volumecache864")
 GLOBAL_STORE_STRATEGIES = ("globalstore", "gsvolumecache", "gshydrate")
-NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache", "volumeprefetch")
+NETWORK_VOLUME_STRATEGIES = ("volume", "volumecache", "volumeprefetch", "volumecache864")
 DATACENTERS = ("US-CA-2", "US-IL-1", "US-KS-2", "US-MO-1", "US-MO-2", "US-NC-2", "US-NE-1", "US-WA-1",
                "EU-CZ-1", "EU-RO-1", "EUR-NO-1")   # runpod.DataCenter (network-volume capable)
 _REPO_ID = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")

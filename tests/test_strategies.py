@@ -95,8 +95,11 @@ class FakeVolumeCache:
     """Mimics VolumeCache's contract: hydrate restores blobs but skips symlinks/refs."""
     mirror: dict[str, bytes] = {}
 
-    def __init__(self, dirs, namespace, volume_path, best_effort):
+    last_kwargs: dict = {}
+
+    def __init__(self, dirs, namespace, volume_path, best_effort, **kwargs):
         self.root = Path(dirs[0])
+        FakeVolumeCache.last_kwargs = kwargs
 
     def hydrate(self):
         for rel, data in self.mirror.items():
@@ -135,6 +138,32 @@ def test_volumecache_populates_then_hydrates_and_relinks(tmp_path, monkeypatch):
     assert cold.notes["hub_fetched_bytes"] < st.POPULATION_MIN_BYTES and not cold.notes["synced"]
     assert cold.hub_online and "hub_s" in cold.timings        # relink needed the Hub
     assert cold.notes["leftover_bytes"] > 0                   # previous local copy was wiped first
+
+
+def test_volumecache_stock_passes_no_hydrate_settings(tmp_path, monkeypatch):
+    """`volumecache` must measure the SDK default, so it may not pin hydrate settings."""
+    FakeVolumeCache.mirror = {}
+    monkeypatch.setattr(st, "_download", lambda repo, cache_dir, token: make_hf_cache(Path(cache_dir), repo))
+    acq = st.acquire_volumecache(REPO, namespace="ns", local_root=str(tmp_path), cache_cls=FakeVolumeCache)
+    assert FakeVolumeCache.last_kwargs == {}
+    assert acq.notes["hydrate_settings"] == "sdk-default"
+
+
+def test_volumecache_tuned_passes_explicit_hydrate_settings(tmp_path, monkeypatch):
+    FakeVolumeCache.mirror = {}
+    monkeypatch.setattr(st, "_download", lambda repo, cache_dir, token: make_hf_cache(Path(cache_dir), repo))
+    acq = st.acquire_volumecache(REPO, namespace="ns", local_root=str(tmp_path), cache_cls=FakeVolumeCache,
+                                 hydrate_settings=st.VOLUMECACHE_864)
+    assert FakeVolumeCache.last_kwargs == {"hydrate_workers": 8, "hydrate_chunk_size": 64 << 20}
+    assert acq.notes["hydrate_settings"] == {"hydrate_workers": 8, "hydrate_chunk_size": 64 << 20}
+
+
+def test_sdk_volumecache_accepts_the_tuned_hydrate_settings(tmp_path):
+    """The pinned runpod release must accept the knob, or volumecache864 fails on the worker."""
+    cls, _ = st.load_volumecache_class()
+    vc = cls(dirs=[str(tmp_path / "d")], namespace="ns", volume_path=str(tmp_path / "v"), best_effort=False,
+             **st.VOLUMECACHE_864)
+    assert (vc._hydrate_workers, vc._hydrate_chunk_size) == (8, 64 << 20)
 
 
 def test_volumecache_is_the_sdk_class():
