@@ -5,6 +5,7 @@ scenario: later steps would measure nothing and keep a paid endpoint around.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
@@ -12,6 +13,7 @@ from typing import Callable, Protocol
 from mscache import phases, spec
 
 POLL_S = 5
+INTERRUPT_POLL_S = 1   # S3 cuts at pod_created + 10 s; a 5 s poll would blur that
 DONE = {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}
 GONE = {"EXITED", "TERMINATED"}
 LIVE_WORKERS = ("initializing", "running", "idle", "ready")
@@ -41,8 +43,14 @@ class _Stop(Exception):
 
 class Driver:
     def __init__(self, client: Client, *, run_id: str, sink: Callable[[dict], None],
-                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
+                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+                 signals: dict[str, threading.Event] | None = None):
         self.rp, self.run_id, self.sink, self.now, self.sleep = client, run_id, sink, now, sleep
+        # shared by every Driver of one run, so S4/S5 arms on separate endpoints can line up
+        self.signals = {} if signals is None else signals
+
+    def _signal(self, tag: str) -> threading.Event:
+        return self.signals.setdefault(tag, threading.Event())
 
     # ------------------------------------------------------------ plumbing
     def _emit(self, rec: dict) -> dict:
@@ -58,9 +66,9 @@ class Driver:
         self._ctx = {"run_id": self.run_id, "scenario": sc.sid, "arm": sc.arm, "dc": sc.dc,
                      "gpu": sc.gpu, "model": sc.model}
         self._sc, self._n_eps, self._ep = sc, 0, None
-        self._create()
         result = ScenarioResult(ok=True)
         try:
+            self._create()
             for i, step in enumerate(sc.steps):
                 self._step(self._ep, i, step, result)
         except _Stop as stop:
@@ -70,7 +78,12 @@ class Driver:
         return result
 
     def _create(self) -> None:
-        created = self.rp.create(self._sc.endpoint_name(self.run_id, self._n_eps), self._sc)
+        """A rejected create (S8: bad revision, unreadable repo) is a result, not a crash."""
+        try:
+            created = self.rp.create(self._sc.endpoint_name(self.run_id, self._n_eps), self._sc)
+        except Exception as e:   # noqa: BLE001 - recorded with its message and returned as the result
+            self._event("create_failed", error=str(e), error_type=type(e).__name__)
+            raise _Stop(f"create_failed: {e}") from e
         self._ep, self._n_eps = created["id"], self._n_eps + 1
         self._ctx |= {"endpoint_id": self._ep, "model_ref": created.get("model_ref")}
         self._event("endpoint_created")
@@ -97,8 +110,58 @@ class Driver:
                 self._wait_no_live_pods(ep, "teardown")
             case spec.AwaitScaleDown():
                 self._wait_no_live_pods(ep, "scale_down")
+            case spec.Interrupt():
+                self._interrupt(ep, i, step)
+            case spec.Signal(tag=tag):
+                self._signal(tag).set()
+                self._event("signal", tag=tag)
+            case spec.Await(tag=tag):
+                self._await(tag)
             case spec.Idle(seconds=s):
                 self.sleep(s)
+
+    def _await(self, tag: str) -> None:
+        ev, deadline = self._signal(tag), self.now() + spec.AWAIT_TIMEOUT_S
+        while not ev.is_set():
+            if self.now() > deadline:
+                raise _Stop(f"await_timeout on {tag}")
+            self.sleep(POLL_S)
+        self._event("await_done", tag=tag)
+
+    # ---------------------------------------------------------- interrupt
+    def _interrupt(self, ep: str, i: int, step: spec.Interrupt) -> None:
+        stale = set(self.rp.pods(ep))
+        self.rp.set_workers_max(ep, 1)
+        submitted = self.now()
+        jid = self.rp.submit(ep, {"hold_s": spec.MEASURE_HOLD_S})
+        pod = self._first_new_pod(ep, jid, submitted, stale)
+        created = phases.epoch(pod.get("createdAt")) or self.now()
+        cut_at = max(created, submitted) + step.after_s
+        while self.now() < cut_at:
+            self.sleep(min(INTERRUPT_POLL_S, cut_at - self.now()))
+        self.rp.set_workers_max(ep, 0)
+        self.rp.cancel(ep, jid)
+        cut = self.now()
+        started = phases.epoch((self.rp.pods(ep).get(pod["id"]) or pod).get("lastStartedAt"))
+        self._emit({"kind": "interrupt", "step": i, "after_s": step.after_s, "job_id": jid,
+                    "pod_id": pod["id"], "machine_id": pod.get("machineId"),
+                    "submitted_utc": phases.iso(submitted), "pod_created_utc": phases.iso(created),
+                    "teardown_utc": phases.iso(cut), "pod_last_started_utc": phases.iso(started),
+                    "teardown_after_pod_s": round(cut - created, 1),
+                    # True: the copy was already staged, so this round is an S2 round, not S3
+                    "container_started_before_teardown": started is not None and started <= cut})
+        self._wait_no_live_pods(ep, "teardown")
+
+    def _first_new_pod(self, ep: str, jid: str, submitted: float, stale: set[str]) -> dict:
+        while True:
+            new = [p for k, p in self.rp.pods(ep).items() if k not in stale]
+            if new:
+                return min(new, key=lambda p: phases.epoch(p.get("createdAt")) or 0)
+            if self.now() - submitted > spec.ABANDON_S:
+                self.rp.cancel(ep, jid)
+                self._event("interrupt_no_worker")
+                raise _Stop("no_worker before interrupt")
+            self.sleep(INTERRUPT_POLL_S)
 
     def _wait_no_live_pods(self, ep: str, what: str) -> None:
         deadline = self.now() + spec.TEARDOWN_TIMEOUT_S
@@ -116,7 +179,7 @@ class Driver:
             self.rp.set_workers_max(ep, 1)
         submitted = self.now()
         jid = self.rp.submit(ep, {"hold_s": d.hold_s})
-        status, seen, failure = self._poll(ep, jid, submitted, stale)
+        status, seen, failure = self._poll(ep, jid, submitted, stale, d.signal)
         wid = status.get("workerId") or ""
         # a worker stopped by idle timeout restarts under its old pod id, so it is in `stale`
         pod = seen.get(wid) or (self.rp.pods(ep).get(wid, {}) if wid in stale else {})
@@ -137,14 +200,18 @@ class Driver:
             raise _Stop(f"{failure} at step {i} ({rec['outcome']})")
         return rec
 
-    def _poll(self, ep: str, jid: str, submitted: float, stale: set[str]) -> tuple[dict, dict, str | None]:
-        """(final status, this load's pods by id, failure or None)."""
+    def _poll(self, ep: str, jid: str, submitted: float, stale: set[str],
+              signal: str | None = None) -> tuple[dict, dict, str | None]:
+        """(final status, this load's pods by id, failure or None). `signal` is set once the job runs."""
         seen: dict[str, dict] = {}
         clocks = {"live": None, "throttled": None}   # first-seen times; live None = nothing placed yet
         while True:
             self.sleep(POLL_S)
             seen |= {k: v for k, v in self.rp.pods(ep).items() if k not in stale}
             status = self.rp.status(ep, jid)
+            if signal and status.get("status") in ("IN_PROGRESS", "COMPLETED") and not self._signal(signal).is_set():
+                self._signal(signal).set()
+                self._event("signal", tag=signal)
             if status.get("status") in DONE:
                 return status, seen, None if status["status"] == "COMPLETED" else "job_" + status["status"].lower()
             t = self.now()

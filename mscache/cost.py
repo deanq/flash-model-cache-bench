@@ -14,6 +14,7 @@ HANDLER_START_S = 20        # pip install runpod + import in python:3.12-slim
 ORIGIN_GBPS = 0.4           # slowest observed pulls (CA-MTL-1 peer p50 was ~0.04 GB/s; origin ~0.2-0.5)
 WORST_GBPS = 0.05
 TEARDOWN_WALL_S = 40        # workersMax 0 until no live pod
+INTERRUPT_PLACE_S = 10      # S3: pod placement before the after_s clock starts
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,10 @@ def estimate(sc: spec.Scenario, *, size_gb: float) -> Estimate:
     for i, d in enumerate(sc.deploys):
         likely += _per_load_s(d, cold_s if i == 0 else CACHED_STAGING_S)
         worst += _per_load_s(d, worst_cold_s)
-    gaps = sum(s.seconds for s in sc.steps if isinstance(s, spec.Idle))
+    # S3: billed from placement to the cut; the redeploy after it is costed as a cold load above
+    cut = sum(s.after_s + INTERRUPT_PLACE_S for s in sc.steps if isinstance(s, spec.Interrupt))
+    likely, worst = likely + cut, worst + cut
+    gaps = sum(s.seconds for s in sc.steps if isinstance(s, spec.Idle)) + cut
     teardowns = sum(isinstance(s, (spec.Teardown, spec.AwaitScaleDown)) for s in sc.steps) * TEARDOWN_WALL_S
     return Estimate(loads=len(sc.deploys), likely_worker_s=likely, worst_worker_s=worst,
                     likely_usd=likely * usd_s, worst_usd=worst * usd_s, wall_s=likely + gaps + teardowns)

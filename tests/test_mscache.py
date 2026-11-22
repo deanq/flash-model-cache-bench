@@ -142,8 +142,10 @@ class FakeClock:
 class FakeRunpod:
     """One endpoint. A submitted job gets a pod `place_after` s later and completes `run_s` after that."""
 
-    def __init__(self, clock, place_after=5.0, run_s=60.0, machines=("7c66abc",), never_place=False):
+    def __init__(self, clock, place_after=5.0, run_s=60.0, machines=("7c66abc",), never_place=False,
+                 start_after=2.0):
         self.clock, self.place_after, self.run_s, self.never_place = clock, place_after, run_s, never_place
+        self.start_after = start_after   # pod placed -> container start (lastStartedAt)
         self.machines = list(machines)
         self.extra_machine = None
         self.workers_max = 0
@@ -190,7 +192,8 @@ class FakeRunpod:
                     continue
                 pid = f"pod{len(self.pods_) + 1}"
                 machine = self.machines[min(len(self.pods_), len(self.machines) - 1)]
-                self.pods_[pid] = _pod(created=t_place, started=t_place + 2, machine=machine, pid=pid) | {"ep": j["ep"]}
+                self.pods_[pid] = _pod(created=t_place, started=t_place + self.start_after, machine=machine,
+                                       pid=pid) | {"ep": j["ep"], "start_t": t_place + self.start_after}
                 if self.exited_while_staging or self.throttled:
                     self.pods_[pid]["desiredStatus"] = "EXITED"
                 j["pod"] = pid
@@ -207,7 +210,8 @@ class FakeRunpod:
     def status(self, ep, jid):
         self._advance()
         j = self.jobs[jid]
-        st = {"id": jid, "status": j["status"]}
+        running = j["status"] == "IN_QUEUE" and "pod" in j
+        st = {"id": jid, "status": "IN_PROGRESS" if running else j["status"]}
         if j["status"] == "COMPLETED":
             now = j["t"] + self.place_after + self.run_s
             st.update(workerId=j["pod"], delayTime=30000, executionTime=1000,
@@ -217,7 +221,11 @@ class FakeRunpod:
 
     def pods(self, ep):
         self._advance()
-        return {k: dict(v) for k, v in self.pods_.items() if v["desiredStatus"] != "GONE" and v["ep"] == ep}
+        out = {k: dict(v) for k, v in self.pods_.items() if v["desiredStatus"] != "GONE" and v["ep"] == ep}
+        for p in out.values():   # lastStartedAt appears when the container starts
+            if self.clock.now() < p.get("start_t", 0):
+                p["lastStartedAt"] = None
+        return out
 
     # live API (11-22 pilot): a pod staging a model or waiting for a GPU is listed desiredStatus EXITED;
     # only /health tells it is initializing or throttled
@@ -371,9 +379,130 @@ def test_recreate_failure_still_leaves_no_endpoint_behind():
             raise RuntimeError("create failed")
         return real(name, scenario)
     rp.create = create
-    with pytest.raises(RuntimeError, match="create failed"):
-        Driver(rp, run_id="t1", sink=lambda r: None, now=clock.now, sleep=clock.sleep).run(sc)
+    lines = []
+    result = Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
+    assert not result.ok and "create failed" in result.reason
     assert rp.deleted == ["ep1"]
+    assert any(r.get("event") == "create_failed" and "create failed" in r["error"] for r in lines)
+
+
+# ------------------------------------------------------- full-matrix specs
+def _kinds(sc):
+    return [type(s).__name__ for s in sc.steps]
+
+
+def test_s1_is_one_cold_load_on_a_model_new_to_the_dc():
+    sc = spec.s1(dc="CA-MTL-1", gpu="a40", model="m/a")
+    assert _kinds(sc) == ["Deploy"] and sc.deploys[0].role == "cold" and sc.sid == "S1"
+
+
+def test_s3_tears_down_after_pod_created_then_redeploys_on_a_fresh_endpoint():
+    sc = spec.s3(dc="CA-MTL-1", gpu="a40", model="m/big", after_s=30)
+    assert _kinds(sc) == ["Interrupt", "Recreate", "Deploy"] and sc.arm == "t30"
+    assert sc.steps[0].after_s == 30 and sc.deploys[0].role == "measure"
+
+
+def test_s7_is_a_cold_load_then_a_fresh_redeploy_per_size_class():
+    sc = spec.s7(dc="CA-MTL-1", gpu="a40", model="m/a", size="large")
+    assert _kinds(sc) == ["Deploy", "Teardown", "Recreate", "Idle", "Deploy"] and sc.arm == "large"
+    assert [d.role for d in sc.deploys] == ["cold", "measure"]
+    with pytest.raises(ValueError, match="size"):
+        spec.s7(dc="CA-MTL-1", gpu="a40", model="m/a", size="huge")
+
+
+def test_s10_redeploys_immediately_on_a_fresh_endpoint():
+    sc = spec.s10(dc="CA-MTL-1", gpu="a40", model="m/a")
+    assert _kinds(sc) == ["Deploy"] + ["Teardown", "Recreate", "Idle", "Deploy"] * 3
+    assert {s.seconds for s in sc.steps if isinstance(s, spec.Idle)} == {0}
+
+
+def test_s8_takes_a_bad_revision_or_unreadable_repo():
+    bad_rev = spec.s8(dc="CA-MTL-1", gpu="a40", model="m/a:0000000000000000000000000000000000000000", arm="badrev")
+    gated = spec.s8(dc="CA-MTL-1", gpu="a40", model="meta-llama/Llama-3.1-8B", arm="gated")
+    assert _kinds(bad_rev) == ["Deploy"] and bad_rev.deploys[0].role == "failure" and gated.arm == "gated"
+    with pytest.raises(ValueError, match="repo"):
+        spec.s8(dc="CA-MTL-1", gpu="a40", model="m/a:", arm="badrev")
+
+
+def test_s4_holder_signals_ready_and_peers_wait_for_the_copy_to_settle():
+    holder, *peers = spec.s4(dc="US-TX-3", gpu="l40s", model="m/a", peers=3)
+    assert holder.arm == "holder" and [p.arm for p in peers] == ["peer1", "peer2", "peer3"]
+    assert holder.deploys[0].signal == "S4:m/a" and holder.deploys[0].hold_s >= spec.S4_HOLD_S
+    for p in peers:
+        assert _kinds(p) == ["Await", "Idle", "Deploy"] and p.steps[0].tag == "S4:m/a"
+        assert p.steps[1].seconds == spec.READY_HOLD_S and p.model == "m/a"
+
+
+def test_s5_plus_warm_redeploy_starts_while_the_cold_pulls_run():
+    scs = spec.s5(dc="US-TX-3", gpu="l40s", cold=["m/c1", "m/c2"], warm="m/w")
+    warm, *cold = scs
+    assert warm.arm == "warm" and [c.arm for c in cold] == ["cold1", "cold2"]
+    assert _kinds(warm) == ["Deploy", "Teardown", "Recreate", "Signal", "Idle", "Deploy"]
+    assert all(_kinds(c) == ["Await", "Deploy"] and c.deploys[0].role == "cold" for c in cold)
+    assert len({s.model for s in scs}) == 3
+    assert [c.arm for c in spec.s5(dc="US-TX-3", gpu="l40s", cold=["m/c1", "m/c2", "m/c3"])] == \
+        ["cold1", "cold2", "cold3"]
+
+
+# ------------------------------------------------------ full-matrix driver
+def test_interrupt_records_whether_the_container_started_before_teardown():
+    sc = spec.s3(dc="CA-MTL-1", gpu="a40", model="m/big", after_s=10)
+    rp, lines, result, _ = _run(sc, start_after=200.0)
+    cut = next(r for r in lines if r["kind"] == "interrupt")
+    assert cut["container_started_before_teardown"] is False and cut["after_s"] == 10
+    assert 10 <= cut["teardown_after_pod_s"] < 10 + 3
+    assert cut["pod_id"] and cut["machine_id"] and cut["teardown_utc"].endswith("Z")
+    load = next(r for r in lines if r["kind"] == "load")
+    assert load["endpoint_id"] == "ep2" and result.ok and rp.deleted == ["ep1", "ep2"]
+
+
+def test_interrupt_after_container_start_is_flagged_so_the_round_counts_as_s2():
+    sc = spec.s3(dc="CA-MTL-1", gpu="a40", model="m/big", after_s=60)
+    _, lines, _, _ = _run(sc, start_after=2.0)
+    cut = next(r for r in lines if r["kind"] == "interrupt")
+    assert cut["container_started_before_teardown"] is True
+
+
+def test_interrupt_with_no_worker_stops_and_cleans_up():
+    sc = spec.s3(dc="US-TX-3", gpu="l40s", model="m/big", after_s=10)
+    rp, lines, result, _ = _run(sc, never_place=True)
+    assert not result.ok and "no_worker" in result.reason and rp.deleted == ["ep1"]
+
+
+def test_create_rejected_is_a_result_not_a_crash():
+    sc = spec.s8(dc="CA-MTL-1", gpu="a40", model="m/a:0000000000000000000000000000000000000000", arm="badrev")
+    clock = FakeClock()
+    rp = FakeRunpod(clock)
+
+    def create(name, scenario):
+        raise RuntimeError("modelReferences not saved")
+    rp.create = create
+    lines = []
+    result = Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
+    assert not result.ok and "modelReferences not saved" in result.reason and rp.deleted == []
+    ev = next(r for r in lines if r.get("event") == "create_failed")
+    assert ev["error"] == "modelReferences not saved"
+
+
+def test_await_times_out_cleanly_when_the_signal_never_comes():
+    _, peer, *_ = spec.s4(dc="US-TX-3", gpu="l40s", model="m/a", peers=1)
+    rp, lines, result, clock = _run(peer)
+    assert not result.ok and "await_timeout" in result.reason and rp.deleted == ["ep1"]
+    assert clock.now() - T0 >= spec.AWAIT_TIMEOUT_S
+
+
+def test_deploy_signal_fires_once_the_job_is_running_and_releases_the_waiter():
+    holder, peer = spec.s4(dc="US-TX-3", gpu="l40s", model="m/a", peers=1)
+    clock = FakeClock()
+    signals = {}
+    rp = FakeRunpod(clock, run_s=spec.S4_HOLD_S)
+    Driver(rp, run_id="t1", sink=lambda r: None, now=clock.now, sleep=clock.sleep, signals=signals).run(holder)
+    assert signals["S4:m/a"].is_set()
+    rp2 = FakeRunpod(clock)
+    lines = []
+    result = Driver(rp2, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep,
+                    signals=signals).run(peer)
+    assert result.ok and [r["role"] for r in lines if r["kind"] == "load"] == ["measure"]
 
 
 def test_throttled_worker_ends_load_as_throttled_after_limit():
@@ -432,3 +561,75 @@ def test_report_keeps_ai_api_floor_loads_out_of_staging_and_counts_resumes():
     assert ", ".join(dict.fromkeys(r["endpoint_id"] for r in loads)) in text
     assert len({r["endpoint_id"] for r in loads}) == 4
     assert "cached (ai-api floor)" in text
+
+
+# ------------------------------------------------------------- matrix plan
+def _scs(lanes):
+    return [s for lane in lanes for batch in lane for s in batch]
+
+
+@pytest.mark.parametrize("dc", plan.LRU_DCS)
+def test_matrix_covers_the_required_scenarios_per_lru_dc(dc):
+    w1, w2 = _scs(plan.matrix(dc, "a40", window=1)), _scs(plan.matrix(dc, "a40", window=2))
+    keys = {f"{s.sid}{s.arm}" for s in w1}
+    assert {"S1", "S2gap60", "S2gap600", "S2gap3600", "S9", "S10", "S7small", "S7medium", "S7large",
+            "S3t10", "S3t30", "S3t60"} <= keys
+    assert any(s.sid == "S4" for s in w2) == (dc in plan.PEER_LIVE)
+    assert any(s.sid == "S8" for s in w2) == (dc == "CA-MTL-1")
+
+
+@pytest.mark.parametrize("window", [1, 2])
+def test_matrix_models_are_distinct_within_a_window_except_s4_arms(window):
+    scs = [s for s in _scs(plan.matrix("CA-MTL-1", "a40", window=window)) if s.sid != "S4"]
+    models = [s.model.split(":")[0] for s in scs if s.sid != "S8"]
+    assert len(models) == len(set(models))
+    pilot_models = {s.model for s in plan.pilot("CA-MTL-1", "a40")}
+    assert not pilot_models & set(models)          # pilot DCs already hold those copies
+
+
+def test_matrix_core_lane_is_serial_and_every_model_has_a_size():
+    lanes = plan.matrix("US-MO-1", "a100", window=1)
+    assert all(len(batch) == 1 for batch in lanes[1])
+    for s in _scs(lanes) + _scs(plan.matrix("US-MO-1", "a100", window=2)) + _scs(plan.control("EUR-IS-2", "4090")):
+        assert plan.size_gb(s) > 0
+
+
+def test_s3_models_are_100_gb_plus_and_s7_sizes_match_their_class():
+    assert all(plan.SIZE_GB[m] >= 100 for m in plan.M["S3"].values())
+    s7 = plan.M["S7"]
+    assert plan.SIZE_GB[s7["small"]] < 10 and 20 <= plan.SIZE_GB[s7["medium"]] <= 40
+    assert plan.SIZE_GB[s7["large"]] >= 100
+
+
+def test_lanes_total_wall_is_longest_lane_of_serial_batches():
+    lanes = plan.matrix("CA-MTL-1", "a40", window=1)
+    tot = plan.lanes_total(lanes)
+    core = sum(plan.total(b)["wall_s"] for b in lanes[1])
+    assert tot["wall_s"] == max(core, plan.total(lanes[0][0])["wall_s"])
+    assert tot["likely_usd"] < tot["worst_usd"]
+    assert plan.lanes_total([])["loads"] == 0
+
+
+def test_cli_only_filters_the_matrix_and_drops_empty_batches():
+    import argparse
+    from mscache.__main__ import _lanes, _scenarios
+    args = argparse.Namespace(dc="CA-MTL-1", gpu="a40", window=1, control=False, only="S3t10,S2gap3600")
+    lanes = _lanes(args)
+    assert [[[s.sid + s.arm for s in b] for b in lane] for lane in lanes] == [[["S2gap3600"]], [["S3t10"]]]
+    pilot = _lanes(argparse.Namespace(dc="CA-MTL-1", gpu="a40", window=None, control=False, only=None, serial=True))
+    assert len(pilot) == 1 and len(_scenarios(pilot)) == 3
+
+
+def test_cli_execute_runs_lanes_in_parallel_and_batches_in_order():
+    from mscache.__main__ import _execute
+    order = []
+
+    class Rec:
+        def run(self, s):
+            order.append(s.sid + s.arm)
+            return ScenarioResult(ok=True)
+    lanes = plan.matrix("US-TX-3", "l40s", window=2)
+    out = _execute(lanes, Rec)
+    assert len(out) == len(_scs(lanes)) and all(r.ok for _, r in out)
+    s4 = [k for k in order if k.startswith("S4")]
+    assert order.index(s4[-1]) < order.index("S5warm")   # S5 batch starts after the S4 batch is done
