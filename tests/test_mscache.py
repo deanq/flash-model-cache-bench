@@ -148,10 +148,12 @@ class FakeRunpod:
                 pid = f"pod{len(self.pods_) + 1}"
                 machine = self.machines[min(len(self.pods_), len(self.machines) - 1)]
                 self.pods_[pid] = _pod(created=t_place, started=t_place + 2, machine=machine, pid=pid)
+                if self.exited_while_staging or self.throttled:
+                    self.pods_[pid]["desiredStatus"] = "EXITED"
                 j["pod"] = pid
                 if self.extra_machine:   # e.g. 7vmo: an extra pod placed for the same job, killed later
                     self.pods_[f"extra{pid}"] = _pod(created=t_place, machine=self.extra_machine, pid=f"extra{pid}")
-            if "pod" in j and self.clock.now() >= t_place + self.run_s:
+            if "pod" in j and self.clock.now() >= t_place + self.run_s and not self.throttled:
                 j["status"] = "COMPLETED"
         for j in self.jobs.values():   # idle timeout removes the worker after its job
             done_t = j["t"] + self.place_after + self.run_s
@@ -172,6 +174,18 @@ class FakeRunpod:
     def pods(self, ep):
         self._advance()
         return {k: dict(v) for k, v in self.pods_.items() if v["desiredStatus"] != "GONE"}
+
+    # live API (11-22 pilot): a pod staging a model or waiting for a GPU is listed desiredStatus EXITED;
+    # only /health tells it is initializing or throttled
+    exited_while_staging = False
+    throttled = False
+
+    def workers(self, ep):
+        self._advance()
+        busy = sum(1 for j in self.jobs.values() if "pod" in j and j["status"] not in ("COMPLETED", "CANCELLED"))
+        if self.throttled:
+            return {"initializing": 0, "running": 0, "idle": 0, "ready": 0, "throttled": busy}
+        return {"initializing": busy, "running": 0, "idle": 0, "ready": 0, "throttled": 0}
 
 
 def _run(sc, **fake_kw):
@@ -241,6 +255,31 @@ def test_pod_only_pods_are_recorded_as_taint():
     Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
     taint = [r for r in lines if r["kind"] == "pod_only"]
     assert taint and taint[0]["pod_id"].startswith("extra") and taint[0]["machine_id"] == "25e7zzz"
+
+
+def test_long_staging_listed_exited_is_not_a_stall_while_health_says_initializing():
+    sc = spec.s9(dc="CA-MTL-1", gpu="a40", model="m/a", repeats=1)
+    clock = FakeClock()
+    rp = FakeRunpod(clock, run_s=spec.STALL_S + 300)
+    rp.exited_while_staging = True
+    lines = []
+    result = Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
+    loads = [r for r in lines if r["kind"] == "load"]
+    assert loads[0]["outcome"] != "failed" and loads[0]["failure"] is None, loads[0]
+    assert result.ok
+
+
+def test_throttled_worker_ends_load_as_throttled_after_limit():
+    sc = spec.s9(dc="US-TX-3", gpu="l40s", model="m/a", repeats=1)
+    clock = FakeClock()
+    rp = FakeRunpod(clock)
+    rp.throttled = True
+    lines = []
+    result = Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
+    load = next(r for r in lines if r["kind"] == "load")
+    assert load["failure"] == "throttled" and not result.ok
+    assert spec.THROTTLE_S <= clock.now() - T0 < spec.THROTTLE_S + 120
+    assert rp.deleted == ["ep1"]
 
 
 # ------------------------------------------------------------ plan/report

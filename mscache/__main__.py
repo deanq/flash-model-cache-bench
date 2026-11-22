@@ -61,8 +61,11 @@ def _run(args) -> int:
                   f"{rec.get('machine_id') or ''} {rec.get('offsets_s', '')}", flush=True)
 
     live = LiveClient()
-    scs = plan.pilot(args.dc, args.gpu)
-    with ThreadPoolExecutor(len(scs)) as pool:
+    scs = [s for s in plan.pilot(args.dc, args.gpu) if not args.only or f"{s.sid}{s.arm}" in args.only.split(",")]
+    if not scs:
+        sys.exit(f"--only {args.only!r} matches no scenario")
+    # --serial: scenarios co-landed on one machine in the 11-22 pilot and shared its download slots
+    with ThreadPoolExecutor(1 if args.serial else len(scs)) as pool:
         results = list(pool.map(lambda s: Driver(live, run_id=run_id, sink=sink).run(s), scs))
     for s, r in zip(scs, results):
         print(f"RESULT {s.sid}{s.arm} ok={r.ok} {r.reason}")
@@ -93,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--gpu", required=True, choices=sorted(spec.GPUS))
         if name == "run":
             sp.add_argument("--spend", action="store_true")
+            sp.add_argument("--only", help="comma list of scenario keys, e.g. S2gap600,S9")
+            sp.add_argument("--serial", action="store_true", help="one scenario at a time")
     sub.add_parser("report").add_argument("run_dir")
     sub.add_parser("leftovers")
     args = p.parse_args(argv)

@@ -14,6 +14,7 @@ from mscache import phases, spec
 POLL_S = 5
 DONE = {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}
 GONE = {"EXITED", "TERMINATED"}
+LIVE_WORKERS = ("initializing", "running", "idle", "ready")
 
 
 class Client(Protocol):
@@ -24,6 +25,7 @@ class Client(Protocol):
     def status(self, ep: str, job_id: str) -> dict: ...
     def cancel(self, ep: str, job_id: str) -> None: ...
     def pods(self, ep: str) -> dict[str, dict]: ...
+    def workers(self, ep: str) -> dict[str, int]: ...
 
 
 @dataclass
@@ -124,7 +126,7 @@ class Driver:
     def _poll(self, ep: str, jid: str, submitted: float, stale: set[str]) -> tuple[dict, dict, str | None]:
         """(final status, this load's pods by id, failure or None)."""
         seen: dict[str, dict] = {}
-        last_live = None
+        clocks = {"live": None, "throttled": None}
         while True:
             self.sleep(POLL_S)
             seen |= {k: v for k, v in self.rp.pods(ep).items() if k not in stale}
@@ -132,18 +134,30 @@ class Driver:
             if status.get("status") in DONE:
                 return status, seen, None if status["status"] == "COMPLETED" else "job_" + status["status"].lower()
             t = self.now()
-            if any(p["desiredStatus"] not in GONE for p in seen.values()) or (seen and last_live is None):
-                last_live = t   # stall clock starts when the first pod appears
-            failure = self._failure(t, submitted, seen, last_live)
+            self._tick(clocks, t, seen, self.rp.workers(ep) if seen else {})
+            failure = self._failure(t, submitted, seen, clocks)
             if failure:
                 self.rp.cancel(ep, jid)
                 return {**status, "status": "CANCELLED"}, seen, failure
 
     @staticmethod
-    def _failure(t: float, submitted: float, seen: dict, last_live: float | None) -> str | None:
+    def _tick(clocks: dict, t: float, seen: dict, workers: dict) -> None:
+        """A staging or GPU-waiting pod is listed EXITED; /health is the truth on whether it is alive."""
+        live = sum(workers.get(k, 0) for k in LIVE_WORKERS) or any(p["desiredStatus"] not in GONE for p in seen.values())
+        if live or (seen and clocks["live"] is None):
+            clocks["live"] = t   # stall clock starts when the first pod appears
+        if workers.get("throttled") and not live:
+            clocks["throttled"] = clocks["throttled"] or t
+        else:
+            clocks["throttled"] = None
+
+    @staticmethod
+    def _failure(t: float, submitted: float, seen: dict, clocks: dict) -> str | None:
         if not seen and t - submitted > spec.ABANDON_S:
             return "no_worker"
-        if seen and last_live is not None and t - last_live > spec.STALL_S:
+        if clocks["throttled"] is not None and t - clocks["throttled"] > spec.THROTTLE_S:
+            return "throttled"
+        if seen and clocks["throttled"] is None and t - clocks["live"] > spec.STALL_S:
             return "stall"
         if t - submitted > spec.ROUND_TIMEOUT_S:
             return "timeout"

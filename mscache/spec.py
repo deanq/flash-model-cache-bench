@@ -16,6 +16,8 @@ MEASURE_HOLD_S = 10
 ABANDON_S = 300
 # a pod staging a large model is not RUNNING yet; only all-pods-exited this long counts as a stall
 STALL_S = 600
+# worker placed but waiting for a free GPU on its machine; the program rule is "no workers for 15 min = stop"
+THROTTLE_S = 900
 ROUND_TIMEOUT_S = 30 * 60
 TEARDOWN_TIMEOUT_S = 600
 SETTLE_S = 60

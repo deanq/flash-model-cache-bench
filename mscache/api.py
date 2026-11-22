@@ -75,6 +75,9 @@ class LiveClient:
     def cancel(self, ep: str, job_id: str) -> None:
         self.rp.cancel(ep, job_id)
 
+    def workers(self, ep: str) -> dict[str, int]:
+        return self.rp.health(ep).get("workers") or {}
+
     def pods(self, ep: str) -> dict[str, dict]:
         eps = self.rp.graphql(PODS_QUERY)["myself"]["endpoints"]
         return {p["id"]: p for e in eps if e["id"] == ep for p in e["pods"] or []}
