@@ -96,6 +96,10 @@ def load_record(*, submitted: float, status: dict, pod: dict, done_seen: float, 
         "pod_reused": reused,
         "floor_wait": _floor_wait(staging, t["container_start"], submitted),
         "staging_s": staging,
+        # staging_s starts at pod_created (a new pod) or submit (a restarted pod); placement wait is not in it
+        "staging_from": None if anchor is None else ("submit" if reused else "pod_created"),
+        "submit_to_container_s": (round(t["container_start"] - submitted, 1)
+                                  if t["container_start"] is not None else None),
         "outcome": _outcome(status.get("status"), staging, no_worker),
         "error": status.get("error"),
     }

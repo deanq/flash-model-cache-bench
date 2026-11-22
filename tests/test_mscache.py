@@ -93,6 +93,22 @@ def test_ai_api_floor_wait_is_flagged_so_cache_numbers_exclude_it():
     assert late["outcome"] == "cached" and late["floor_wait"] is False
 
 
+def test_staging_is_labeled_by_anchor_and_submit_to_container_is_recorded():
+    # 64q5on3hbd3zjf, MO-1 11-22: new pod at +24.9 s, container at +48.3 s
+    rec = phases.load_record(submitted=T0, status={"status": "COMPLETED", "output": _output(
+        container_start=T0 + 48.3, handler_start=T0 + 60, now=T0 + 61)}, pod=_pod(created=T0 + 24.9),
+        done_seen=T0 + 200)
+    assert rec["staging_s"] == 23.4 and rec["staging_from"] == "pod_created"
+    assert rec["submit_to_container_s"] == 48.3 and rec["floor_wait"] is True
+    restarted = phases.load_record(submitted=T0, status={"status": "COMPLETED", "output": _output(
+        container_start=T0 + 2.0, handler_start=T0 + 10, now=T0 + 11)}, pod=_pod(created=T0 - 600),
+        done_seen=T0 + 100)
+    assert restarted["staging_from"] == "submit" and restarted["staging_s"] == 2.0
+    text = report.render([rec | {"role": "measure", "scenario": "S2", "arm": "gap60", "endpoint_id": "e",
+                                 "model": "m/a", "same_machine_as_prev": None, "resumed": False}])
+    assert "23.4 (from pod_created) | 48.3 |" in text and "submit->container start: median 48s" in text
+
+
 def test_no_worker_and_failed_outcomes():
     nw = phases.load_record(submitted=T0, status={"status": "CANCELLED"}, pod={}, done_seen=T0 + 300, no_worker=True)
     assert nw["outcome"] == "no_worker" and nw["pod_id"] is None
@@ -410,7 +426,7 @@ def test_report_keeps_ai_api_floor_loads_out_of_staging_and_counts_resumes():
         r["staging_s"] = 4.0
     measure[2]["resumed"] = True
     text = report.render(lines)
-    assert "staging (excl. ai-api floor): median 4s, worst 4s" in text
+    assert "staging_s (excl. ai-api floor): median 4s, worst 4s" in text
     assert "cached behind ai-api floor: 1" in text
     assert "new pod=2 resumed (same pod id)=1" in text
     assert ", ".join(dict.fromkeys(r["endpoint_id"] for r in loads)) in text
