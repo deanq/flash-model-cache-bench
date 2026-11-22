@@ -107,7 +107,9 @@ class Driver:
         submitted = self.now()
         jid = self.rp.submit(ep, {"hold_s": d.hold_s})
         status, seen, failure = self._poll(ep, jid, submitted, stale)
-        pod = seen.get(status.get("workerId") or "", {})
+        wid = status.get("workerId") or ""
+        # a worker stopped by idle timeout restarts under its old pod id, so it is in `stale`
+        pod = seen.get(wid) or (self.rp.pods(ep).get(wid, {}) if wid in stale else {})
         rec = phases.load_record(submitted=submitted, status={"id": jid, **status}, pod=pod,
                                  done_seen=self.now(), no_worker=failure == "no_worker")
         last = next((r["machine_id"] for r in reversed(prev) if r.get("machine_id")), None)

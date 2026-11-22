@@ -3,7 +3,7 @@
 Phases: submit -> pod_created -> pod_last_started (lastStartedAt, "resumed") -> container_start
 (pid 1 start, in-container) -> handler_ready -> job_start -> job_done_seen (first poll that saw it).
 Model staging happens before the container starts (the copy is mounted, not downloaded in-container),
-so staging_s = container_start - pod_created. It includes the ai-api wait (0 or ~45 s), so the
+so staging_s = container_start - pod_created (or submit, for a restarted pod that kept its id). It includes the ai-api wait (0 or ~45 s), so the
 outcome here is an estimate; the main Mac's host-log join (peer/origin per file) is final.
 """
 from __future__ import annotations
@@ -57,8 +57,11 @@ def load_record(*, submitted: float, status: dict, pod: dict, done_seen: float, 
          "pod_last_started": epoch(pod.get("lastStartedAt")),
          **_in_container(out),
          "job_done_seen": done_seen}
-    staging = (round(t["container_start"] - t["pod_created"], 1)
-               if t["container_start"] is not None and t["pod_created"] is not None else None)
+    # a restarted pod keeps its old createdAt; its staging cannot start before this load's submit
+    reused = t["pod_created"] is not None and t["pod_created"] < submitted
+    anchor = max(t["pod_created"], submitted) if t["pod_created"] is not None else None
+    staging = (round(t["container_start"] - anchor, 1)
+               if t["container_start"] is not None and anchor is not None else None)
     snapshot = out.get("snapshot")
     machine = pod.get("machine") or {}
     return {
@@ -78,6 +81,7 @@ def load_record(*, submitted: float, status: dict, pod: dict, done_seen: float, 
         "submitted": submitted,
         "phases_utc": {k: iso(v) for k, v in t.items()},
         "offsets_s": {k: round(v - submitted, 1) for k, v in t.items() if k != "submit" and v is not None},
+        "pod_reused": reused,
         "staging_s": staging,
         "outcome": _outcome(status.get("status"), staging, no_worker),
         "error": status.get("error"),

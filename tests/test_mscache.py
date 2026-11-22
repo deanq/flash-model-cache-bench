@@ -145,6 +145,11 @@ class FakeRunpod:
                 continue
             t_place = j["t"] + self.place_after
             if self.clock.now() >= t_place and "pod" not in j:
+                if self.reuse_pods and self.pods_:   # a stopped worker restarts under its old pod id
+                    pid = next(iter(self.pods_))
+                    self.pods_[pid] |= {"desiredStatus": "RUNNING", "lastStartedAt": phases.iso(t_place + 2)}
+                    j["pod"] = pid
+                    continue
                 pid = f"pod{len(self.pods_) + 1}"
                 machine = self.machines[min(len(self.pods_), len(self.machines) - 1)]
                 self.pods_[pid] = _pod(created=t_place, started=t_place + 2, machine=machine, pid=pid)
@@ -179,6 +184,7 @@ class FakeRunpod:
     # only /health tells it is initializing or throttled
     exited_while_staging = False
     throttled = False
+    reuse_pods = False
 
     def workers(self, ep):
         self._advance()
@@ -267,6 +273,18 @@ def test_long_staging_listed_exited_is_not_a_stall_while_health_says_initializin
     loads = [r for r in lines if r["kind"] == "load"]
     assert loads[0]["outcome"] != "failed" and loads[0]["failure"] is None, loads[0]
     assert result.ok
+
+
+def test_restarted_worker_with_reused_pod_id_is_joined_and_classified():
+    sc = spec.s9(dc="CA-MTL-1", gpu="a40", model="m/a", repeats=1)
+    clock = FakeClock()
+    rp = FakeRunpod(clock)
+    rp.reuse_pods = True
+    lines = []
+    Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
+    measure = [r for r in lines if r["kind"] == "load"][1]
+    assert measure["machine_id"] == "7c66abc" and measure["pod_reused"] is True
+    assert measure["outcome"] == "cached", measure   # staging anchored on submit, not the old createdAt
 
 
 def test_throttled_worker_ends_load_as_throttled_after_limit():
