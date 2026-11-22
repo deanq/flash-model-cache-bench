@@ -47,8 +47,9 @@ def _smoke(args) -> int:
 def _run(args) -> int:
     if not args.spend:
         sys.exit("refusing to spend without --spend (run `plan` first and get Dean's go)")
+    # parallel per-DC runs start in the same minute; the DC keeps their dirs apart
     run_id = time.strftime("%m%d%H%M", time.gmtime())
-    out = RUNS / run_id
+    out = RUNS / f"{run_id}-{args.dc}-{args.gpu}"
     out.mkdir(parents=True)
     lock, path = threading.Lock(), out / "records.jsonl"
 
