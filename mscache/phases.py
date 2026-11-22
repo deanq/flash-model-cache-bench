@@ -13,6 +13,9 @@ from pathlib import PurePosixPath
 
 # cached loads stage in 2-5 s, or 45-60 s when the ai-api wait lands here; cold pulls ran 130 s+
 CACHED_STAGING_MAX_S = 75
+# ai-api's scale-from-zero floor (40 s min queue time) lands 42-50 s after submit (11-22 joined read);
+# a cached load whose container starts this late is ai-api time, not copy time
+FLOOR_MIN_S = 38
 
 
 def iso(epoch: float | None) -> str | None:
@@ -50,6 +53,15 @@ def _outcome(status: str | None, staging_s: float | None, no_worker: bool) -> st
     return "cached" if staging_s <= CACHED_STAGING_MAX_S else "pull"
 
 
+def _floor_wait(staging_s: float | None, container_start: float | None, submitted: float) -> bool:
+    """Cached, and the ai-api floor fell inside the staging window: the window opened before the floor
+    ended and the container started after it. A pod placed late (TX-3, +238 s) staged after the floor."""
+    if staging_s is None or container_start is None or staging_s > CACHED_STAGING_MAX_S:
+        return False
+    started = container_start - submitted
+    return started - staging_s < FLOOR_MIN_S <= started
+
+
 def load_record(*, submitted: float, status: dict, pod: dict, done_seen: float, no_worker: bool = False) -> dict:
     out = status.get("output") if isinstance(status.get("output"), dict) else {}
     t = {"submit": submitted,
@@ -82,6 +94,7 @@ def load_record(*, submitted: float, status: dict, pod: dict, done_seen: float, 
         "phases_utc": {k: iso(v) for k, v in t.items()},
         "offsets_s": {k: round(v - submitted, 1) for k, v in t.items() if k != "submit" and v is not None},
         "pod_reused": reused,
+        "floor_wait": _floor_wait(staging, t["container_start"], submitted),
         "staging_s": staging,
         "outcome": _outcome(status.get("status"), staging, no_worker),
         "error": status.get("error"),

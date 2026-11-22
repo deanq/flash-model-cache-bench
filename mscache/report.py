@@ -15,26 +15,35 @@ def _scenario(key: tuple[str, str], recs: list[dict]) -> list[str]:
     loads = [r for r in recs if r["kind"] == "load"]
     measure = [r for r in loads if r["role"] == "measure"]
     ready = [r["offsets_s"]["job_start"] for r in measure if "job_start" in r["offsets_s"]]
-    staging = [r["staging_s"] for r in measure if r["staging_s"] is not None]
+    # a cached load that waited out ai-api's scale-from-zero floor measures ai-api, not the copy
+    floor = [r for r in measure if r.get("floor_wait")]
+    staging = [r["staging_s"] for r in measure if r["staging_s"] is not None and not r.get("floor_wait")]
     outcomes = Counter(r["outcome"] for r in measure)
     same = Counter(r["same_machine_as_prev"] for r in measure)
+    resumed = Counter(bool(r.get("resumed")) for r in measure)
     taint = sum(r["kind"] == "pod_only" for r in recs)
     head = f"## {key[0]} {key[1]}".rstrip()
-    ep = loads[0]["endpoint_id"] if loads else "?"
+    eps = ", ".join(dict.fromkeys(r["endpoint_id"] for r in loads)) or "?"
     model = loads[0]["model"] if loads else "?"
-    return [f"{head}  (ep {ep}, model {model})",
-            f"- measure loads: {len(measure)}; submit->job start: {_stat(ready)}; staging: {_stat(staging)}",
+    return [f"{head}  (ep {eps}, model {model})",
+            f"- measure loads: {len(measure)}; submit->job start: {_stat(ready)}; "
+            f"staging (excl. ai-api floor): {_stat(staging)}; cached behind ai-api floor: {len(floor)}",
             "- outcomes: " + ", ".join(f"{k}={v}" for k, v in sorted(outcomes.items())),
+            f"- worker: new pod={resumed[False]} resumed (same pod id)={resumed[True]}",
             f"- same machine as previous load: yes={same[True]} no={same[False]}; pod-only pods (taint): {taint}"]
 
 
 def _join_rows(recs: list[dict]) -> list[str]:
-    cols = ["scenario", "role", "endpoint", "pod", "machine", "model", "revision", "GB", "outcome", *JOIN_PHASES]
+    cols = ["scenario", "role", "endpoint", "pod", "worker", "machine", "model", "revision", "GB", "outcome",
+            *JOIN_PHASES]
     rows = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     for r in (r for r in recs if r["kind"] == "load"):
         gb = f"{r['staged_bytes'] / 1e9:.1f}" if r.get("staged_bytes") else ""
-        cells = [f"{r['scenario']} {r['arm']}".strip(), r["role"], r["endpoint_id"], r["pod_id"], r["machine_id"],
-                 r["model"], r["revision"], gb, r["outcome"], *(r["phases_utc"].get(p) for p in JOIN_PHASES)]
+        worker = "resumed" if r.get("resumed") else "new"
+        outcome = f"{r['outcome']} (ai-api floor)" if r.get("floor_wait") else r["outcome"]
+        cells = [f"{r['scenario']} {r['arm']}".strip(), r["role"], r["endpoint_id"], r["pod_id"], worker,
+                 r["machine_id"], r["model"], r["revision"], gb, outcome,
+                 *(r["phases_utc"].get(p) for p in JOIN_PHASES)]
         rows.append("| " + " | ".join(str(c or "") for c in cells) + " |")
     return rows
 

@@ -57,21 +57,28 @@ class Driver:
     def run(self, sc: spec.Scenario) -> ScenarioResult:
         self._ctx = {"run_id": self.run_id, "scenario": sc.sid, "arm": sc.arm, "dc": sc.dc,
                      "gpu": sc.gpu, "model": sc.model}
-        created = self.rp.create(sc.endpoint_name(self.run_id), sc)
-        ep = created["id"]
-        self._ctx |= {"endpoint_id": ep, "model_ref": created.get("model_ref")}
-        self._event("endpoint_created")
+        self._sc, self._n_eps, self._ep = sc, 0, None
+        self._create()
         result = ScenarioResult(ok=True)
         try:
             for i, step in enumerate(sc.steps):
-                self._step(ep, i, step, result)
+                self._step(self._ep, i, step, result)
         except _Stop as stop:
             result.ok, result.reason = False, str(stop)
         finally:
-            self._cleanup(ep)
+            self._cleanup()
         return result
 
-    def _cleanup(self, ep: str) -> None:
+    def _create(self) -> None:
+        created = self.rp.create(self._sc.endpoint_name(self.run_id, self._n_eps), self._sc)
+        self._ep, self._n_eps = created["id"], self._n_eps + 1
+        self._ctx |= {"endpoint_id": self._ep, "model_ref": created.get("model_ref")}
+        self._event("endpoint_created")
+
+    def _cleanup(self) -> None:
+        ep, self._ep = self._ep, None
+        if ep is None:   # a failed Recreate already deleted the old one
+            return
         try:
             self.rp.set_workers_max(ep, 0)
         finally:
@@ -80,6 +87,9 @@ class Driver:
 
     def _step(self, ep: str, i: int, step: spec.Step, result: ScenarioResult) -> None:
         match step:
+            case spec.Recreate():
+                self._cleanup()
+                self._create()
             case spec.Deploy():
                 result.loads.append(self._deploy(ep, i, step, result.loads))
             case spec.Teardown():
@@ -114,6 +124,8 @@ class Driver:
                                  done_seen=self.now(), no_worker=failure == "no_worker")
         last = next((r["machine_id"] for r in reversed(prev) if r.get("machine_id")), None)
         rec |= {"role": d.role, "step": i, "hold_s": d.hold_s, "failure": failure,
+                # resumed = an earlier worker restarted (same pod id), not a new pod placed for this load
+                "resumed": bool(rec["pod_reused"] or rec["pod_id"] in {r["pod_id"] for r in prev if r.get("pod_id")}),
                 "same_machine_as_prev": (rec["machine_id"] == last) if last and rec["machine_id"] else None}
         rec = self._emit(rec)
         for pid, p in seen.items():

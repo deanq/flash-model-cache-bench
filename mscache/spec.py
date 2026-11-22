@@ -63,11 +63,18 @@ class AwaitScaleDown:
 
 
 @dataclass(frozen=True)
+class Recreate:
+    """Delete the endpoint and create a fresh one (same DC, GPU pool, model). ai-api resumes a stopped
+    worker (same pod id, same machine) before placing a new one, so only a new endpoint guarantees
+    the next load is a NEW worker and measures LRU retention, not a resume."""
+
+
+@dataclass(frozen=True)
 class Idle:
     seconds: int
 
 
-Step = Deploy | Teardown | AwaitScaleDown | Idle
+Step = Deploy | Teardown | AwaitScaleDown | Recreate | Idle
 
 
 @dataclass(frozen=True)
@@ -85,20 +92,27 @@ class Scenario:
         if not _REPO.match(self.model):
             raise ValueError(f"model must be an HF repo id like org/name, got {self.model!r}")
 
-    def endpoint_name(self, run_id: str) -> str:
+    def endpoint_name(self, run_id: str, n: int = 0) -> str:
+        """n > 0 names the n-th recreated endpoint of the scenario."""
         dc = self.dc.lower().replace("us-", "").replace("-", "")
-        return f"{NAME_PREFIX}{dc}-{self.sid.lower()}{self.arm}-{self.gpu}-{run_id}"[:60]
+        suffix = f"-{n}" if n else ""
+        return f"{NAME_PREFIX}{dc}-{self.sid.lower()}{self.arm}-{self.gpu}-{run_id}"[:60 - len(suffix)] + suffix
 
     @property
     def deploys(self) -> list[Deploy]:
         return [s for s in self.steps if isinstance(s, Deploy)]
 
 
+def fresh_redeploy(gap_s: int, hold_s: int = READY_HOLD_S) -> list[Step]:
+    """Teardown, new endpoint, gap, deploy: the redeploy is a new worker (for S2, S3, S10)."""
+    return [Teardown(), Recreate(), Idle(gap_s), Deploy("measure", hold_s)]
+
+
 def s2(*, dc: str, gpu: str, model: str, gap_s: int, repeats: int = 3) -> Scenario:
-    """Warm reuse after teardown: seed, then [teardown, idle gap, redeploy] x repeats."""
+    """Warm reuse after teardown: seed, then [teardown, new endpoint, idle gap, redeploy] x repeats."""
     steps: list[Step] = [Deploy("seed", READY_HOLD_S)]
     for _ in range(repeats):
-        steps += [Teardown(), Idle(gap_s), Deploy("measure", READY_HOLD_S)]
+        steps += fresh_redeploy(gap_s)
     return Scenario("S2", f"gap{gap_s}", dc, gpu, model, tuple(steps))
 
 

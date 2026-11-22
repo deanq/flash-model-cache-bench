@@ -13,7 +13,8 @@ T0 = 1_700_000_000.0
 def test_s2_arm_is_seed_then_repeats_of_teardown_gap_redeploy():
     sc = spec.s2(dc="CA-MTL-1", gpu="a40", model="m/a", gap_s=600, repeats=3)
     kinds = [type(s).__name__ for s in sc.steps]
-    assert kinds == ["Deploy"] + ["Teardown", "Idle", "Deploy"] * 3
+    # a fresh endpoint per redeploy: ai-api resumes a stopped worker (same pod, same machine) before placing a new one
+    assert kinds == ["Deploy"] + ["Teardown", "Recreate", "Idle", "Deploy"] * 3
     deploys = [s for s in sc.steps if isinstance(s, spec.Deploy)]
     assert deploys[0].role == "seed" and all(d.role == "measure" for d in deploys[1:])
     assert all(d.hold_s == spec.READY_HOLD_S for d in deploys)   # copy fully on disk before teardown
@@ -40,6 +41,7 @@ def test_endpoint_name_is_prefixed_and_short():
     sc = spec.s2(dc="CA-MTL-1", gpu="a40", model="m/a", gap_s=60)
     name = sc.endpoint_name("r1121a")
     assert name.startswith(spec.NAME_PREFIX) and "camtl1" in name and len(name) <= 60
+    assert sc.endpoint_name("r1121a", 2).endswith("-2") and sc.endpoint_name("r1121a", 2) != name
 
 
 # ---------------------------------------------------------------- phases
@@ -74,6 +76,21 @@ def test_outcome_estimate_from_staging(staging, want):
     rec = phases.load_record(submitted=T0, status={"status": "COMPLETED", "workerId": "pod1", "output": out},
                              pod=_pod(), done_seen=T0 + 200)
     assert rec["outcome"] == want
+
+
+def test_ai_api_floor_wait_is_flagged_so_cache_numbers_exclude_it():
+    # aj82koxw08zcbp, 11-22: pod created at +0.8 s, container at +49.7 s, no transfer (local copy)
+    rec = phases.load_record(submitted=T0, status={"status": "COMPLETED", "output": _output(
+        container_start=T0 + 49.7, handler_start=T0 + 71, now=T0 + 72)}, pod=_pod(created=T0 + 0.8), done_seen=T0 + 200)
+    assert rec["outcome"] == "cached" and rec["floor_wait"] is True
+    fast = phases.load_record(submitted=T0, status={"status": "COMPLETED", "output": _output(
+        container_start=T0 + 3.9, handler_start=T0 + 25, now=T0 + 26)}, pod=_pod(created=T0 + 1), done_seen=T0 + 150)
+    assert fast["floor_wait"] is False
+    # kzlvbq4ht3vm26, TX-3 11-22: pod placed at +238 s, staged 23.6 s after the floor had ended
+    late = phases.load_record(submitted=T0, status={"status": "COMPLETED", "output": _output(
+        container_start=T0 + 261.7, handler_start=T0 + 280, now=T0 + 281)}, pod=_pod(created=T0 + 238.1),
+        done_seen=T0 + 400)
+    assert late["outcome"] == "cached" and late["floor_wait"] is False
 
 
 def test_no_worker_and_failed_outcomes():
@@ -119,10 +136,14 @@ class FakeRunpod:
 
     def create(self, name, scenario):
         self.created.append(name)
-        return {"id": "ep1", "model_ref": f"huggingface.co/{scenario.model}@abc123"}
+        self.ep = f"ep{len(self.created)}"
+        return {"id": self.ep, "model_ref": f"huggingface.co/{scenario.model}@abc123"}
 
     def delete(self, ep):
         self.deleted.append(ep)
+        for p in self.pods_.values():
+            if p["ep"] == ep:
+                p["desiredStatus"] = "GONE"
 
     def set_workers_max(self, ep, n):
         self.workers_max = n
@@ -133,7 +154,7 @@ class FakeRunpod:
     def submit(self, ep, payload):
         self.n += 1
         jid = f"j{self.n}"
-        self.jobs[jid] = {"t": self.clock.now(), "payload": payload, "status": "IN_QUEUE"}
+        self.jobs[jid] = {"t": self.clock.now(), "payload": payload, "status": "IN_QUEUE", "ep": ep}
         return jid
 
     def cancel(self, ep, jid):
@@ -145,19 +166,21 @@ class FakeRunpod:
                 continue
             t_place = j["t"] + self.place_after
             if self.clock.now() >= t_place and "pod" not in j:
-                if self.reuse_pods and self.pods_:   # a stopped worker restarts under its old pod id
-                    pid = next(iter(self.pods_))
+                mine = [k for k, p in self.pods_.items() if p["ep"] == j["ep"]]
+                if self.reuse_pods and mine:   # ai-api resumes a stopped worker of THIS endpoint, same pod id
+                    pid = mine[0]
                     self.pods_[pid] |= {"desiredStatus": "RUNNING", "lastStartedAt": phases.iso(t_place + 2)}
                     j["pod"] = pid
                     continue
                 pid = f"pod{len(self.pods_) + 1}"
                 machine = self.machines[min(len(self.pods_), len(self.machines) - 1)]
-                self.pods_[pid] = _pod(created=t_place, started=t_place + 2, machine=machine, pid=pid)
+                self.pods_[pid] = _pod(created=t_place, started=t_place + 2, machine=machine, pid=pid) | {"ep": j["ep"]}
                 if self.exited_while_staging or self.throttled:
                     self.pods_[pid]["desiredStatus"] = "EXITED"
                 j["pod"] = pid
                 if self.extra_machine:   # e.g. 7vmo: an extra pod placed for the same job, killed later
-                    self.pods_[f"extra{pid}"] = _pod(created=t_place, machine=self.extra_machine, pid=f"extra{pid}")
+                    self.pods_[f"extra{pid}"] = _pod(created=t_place, machine=self.extra_machine,
+                                                     pid=f"extra{pid}") | {"ep": j["ep"]}
             if "pod" in j and self.clock.now() >= t_place + self.run_s and not self.throttled:
                 j["status"] = "COMPLETED"
         for j in self.jobs.values():   # idle timeout removes the worker after its job
@@ -178,7 +201,7 @@ class FakeRunpod:
 
     def pods(self, ep):
         self._advance()
-        return {k: dict(v) for k, v in self.pods_.items() if v["desiredStatus"] != "GONE"}
+        return {k: dict(v) for k, v in self.pods_.items() if v["desiredStatus"] != "GONE" and v["ep"] == ep}
 
     # live API (11-22 pilot): a pod staging a model or waiting for a GPU is listed desiredStatus EXITED;
     # only /health tells it is initializing or throttled
@@ -208,11 +231,14 @@ def test_driver_runs_s2_records_every_load_and_always_deletes():
     rp, lines, result, _ = _run(sc)
     loads = [r for r in lines if r["kind"] == "load"]
     assert [r["role"] for r in loads] == ["seed", "measure", "measure"]
-    assert all(r["outcome"] == "cached" and r["endpoint_id"] == "ep1" for r in loads)
+    assert all(r["outcome"] == "cached" for r in loads)
+    assert [r["endpoint_id"] for r in loads] == ["ep1", "ep2", "ep3"]   # fresh endpoint per redeploy
+    assert [r["resumed"] for r in loads] == [False, False, False]
     assert all(r["scenario"] == "S2" and r["arm"] == "gap60" and r["dc"] == "CA-MTL-1" for r in loads)
     assert loads[1]["same_machine_as_prev"] is True
     assert loads[0]["model_ref"].endswith("@abc123")
-    assert rp.deleted == ["ep1"] and isinstance(result, ScenarioResult) and result.ok
+    assert rp.deleted == ["ep1", "ep2", "ep3"] and isinstance(result, ScenarioResult) and result.ok
+    assert len(set(rp.created)) == 3
 
 
 def test_driver_holds_job_for_ready_plus_two_minutes():
@@ -294,6 +320,46 @@ def test_late_placement_like_tx3_470s_is_not_abandoned():
     assert load["failure"] is None and result.ok, load
 
 
+def test_s2_redeploy_cannot_resume_the_old_worker_even_when_the_platform_would():
+    sc = spec.s2(dc="CA-MTL-1", gpu="a40", model="m/a", gap_s=60, repeats=2)
+    clock = FakeClock()
+    rp = FakeRunpod(clock)
+    rp.reuse_pods = True
+    lines = []
+    Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
+    loads = [r for r in lines if r["kind"] == "load"]
+    assert len({r["pod_id"] for r in loads}) == 3 and not any(r["resumed"] for r in loads)
+    events = [r["event"] for r in lines if r["kind"] == "event"]
+    assert events.count("endpoint_created") == 3 and events.count("endpoint_deleted") == 3
+
+
+def test_s9_resume_is_flagged_on_the_load():
+    sc = spec.s9(dc="CA-MTL-1", gpu="a40", model="m/a", repeats=1)
+    clock = FakeClock()
+    rp = FakeRunpod(clock)
+    rp.reuse_pods = True
+    lines = []
+    Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep).run(sc)
+    seed, measure = [r for r in lines if r["kind"] == "load"]
+    assert seed["resumed"] is False and measure["resumed"] is True
+
+
+def test_recreate_failure_still_leaves_no_endpoint_behind():
+    sc = spec.s2(dc="CA-MTL-1", gpu="a40", model="m/a", gap_s=60, repeats=1)
+    clock = FakeClock()
+    rp = FakeRunpod(clock)
+    real = rp.create
+
+    def create(name, scenario):
+        if rp.created:
+            raise RuntimeError("create failed")
+        return real(name, scenario)
+    rp.create = create
+    with pytest.raises(RuntimeError, match="create failed"):
+        Driver(rp, run_id="t1", sink=lambda r: None, now=clock.now, sleep=clock.sleep).run(sc)
+    assert rp.deleted == ["ep1"]
+
+
 def test_throttled_worker_ends_load_as_throttled_after_limit():
     sc = spec.s9(dc="US-TX-3", gpu="l40s", model="m/a", repeats=1)
     clock = FakeClock()
@@ -332,3 +398,21 @@ def test_report_summarizes_measure_loads_median_and_worst():
     assert "S2 gap60" in text and "measure loads: 3" in text
     assert "median" in text and "worst" in text and "ep1" in text
     assert "outcomes: cached=3" in text
+
+
+def test_report_keeps_ai_api_floor_loads_out_of_staging_and_counts_resumes():
+    sc = spec.s2(dc="CA-MTL-1", gpu="a40", model="m/a", gap_s=60, repeats=3)
+    _, lines, _, _ = _run(sc)
+    loads = [r for r in lines if r["kind"] == "load"]
+    measure = [r for r in loads if r["role"] == "measure"]
+    measure[0] |= {"floor_wait": True, "staging_s": 49.0}
+    for r in measure[1:]:
+        r["staging_s"] = 4.0
+    measure[2]["resumed"] = True
+    text = report.render(lines)
+    assert "staging (excl. ai-api floor): median 4s, worst 4s" in text
+    assert "cached behind ai-api floor: 1" in text
+    assert "new pod=2 resumed (same pod id)=1" in text
+    assert ", ".join(dict.fromkeys(r["endpoint_id"] for r in loads)) in text
+    assert len({r["endpoint_id"] for r in loads}) == 4
+    assert "cached (ai-api floor)" in text
