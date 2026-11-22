@@ -287,6 +287,13 @@ def test_restarted_worker_with_reused_pod_id_is_joined_and_classified():
     assert measure["outcome"] == "cached", measure   # staging anchored on submit, not the old createdAt
 
 
+def test_late_placement_like_tx3_470s_is_not_abandoned():
+    sc = spec.s9(dc="US-TX-3", gpu="l40s", model="m/a", repeats=1)
+    _, lines, result, _ = _run(sc, place_after=470.0)
+    load = next(r for r in lines if r["kind"] == "load")
+    assert load["failure"] is None and result.ok, load
+
+
 def test_throttled_worker_ends_load_as_throttled_after_limit():
     sc = spec.s9(dc="US-TX-3", gpu="l40s", model="m/a", repeats=1)
     clock = FakeClock()

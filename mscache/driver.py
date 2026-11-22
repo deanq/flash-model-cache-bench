@@ -128,7 +128,7 @@ class Driver:
     def _poll(self, ep: str, jid: str, submitted: float, stale: set[str]) -> tuple[dict, dict, str | None]:
         """(final status, this load's pods by id, failure or None)."""
         seen: dict[str, dict] = {}
-        clocks = {"live": None, "throttled": None}
+        clocks = {"live": None, "throttled": None}   # first-seen times; live None = nothing placed yet
         while True:
             self.sleep(POLL_S)
             seen |= {k: v for k, v in self.rp.pods(ep).items() if k not in stale}
@@ -136,8 +136,8 @@ class Driver:
             if status.get("status") in DONE:
                 return status, seen, None if status["status"] == "COMPLETED" else "job_" + status["status"].lower()
             t = self.now()
-            self._tick(clocks, t, seen, self.rp.workers(ep) if seen else {})
-            failure = self._failure(t, submitted, seen, clocks)
+            self._tick(clocks, t, seen, self.rp.workers(ep))
+            failure = self._failure(t, submitted, clocks)
             if failure:
                 self.rp.cancel(ep, jid)
                 return {**status, "status": "CANCELLED"}, seen, failure
@@ -146,20 +146,21 @@ class Driver:
     def _tick(clocks: dict, t: float, seen: dict, workers: dict) -> None:
         """A staging or GPU-waiting pod is listed EXITED; /health is the truth on whether it is alive."""
         live = sum(workers.get(k, 0) for k in LIVE_WORKERS) or any(p["desiredStatus"] not in GONE for p in seen.values())
-        if live or (seen and clocks["live"] is None):
-            clocks["live"] = t   # stall clock starts when the first pod appears
+        placed = bool(seen or live or workers.get("throttled"))
+        if live or (placed and clocks["live"] is None):
+            clocks["live"] = t   # stall clock starts when the worker first shows up
         if workers.get("throttled") and not live:
             clocks["throttled"] = clocks["throttled"] or t
         else:
             clocks["throttled"] = None
 
     @staticmethod
-    def _failure(t: float, submitted: float, seen: dict, clocks: dict) -> str | None:
-        if not seen and t - submitted > spec.ABANDON_S:
+    def _failure(t: float, submitted: float, clocks: dict) -> str | None:
+        if clocks["live"] is None and t - submitted > spec.ABANDON_S:
             return "no_worker"
         if clocks["throttled"] is not None and t - clocks["throttled"] > spec.THROTTLE_S:
             return "throttled"
-        if seen and clocks["throttled"] is None and t - clocks["live"] > spec.STALL_S:
+        if clocks["live"] is not None and clocks["throttled"] is None and t - clocks["live"] > spec.STALL_S:
             return "stall"
         if t - submitted > spec.ROUND_TIMEOUT_S:
             return "timeout"

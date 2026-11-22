@@ -12,8 +12,9 @@ NAME_PREFIX = "msc-"
 # handler ready + 2 min: the host reports the copy DEPLOYED before teardown, so LRU keeps it
 READY_HOLD_S = 120
 MEASURE_HOLD_S = 10
-# a placed worker shows up as a pod within seconds even while the model is pulling; none after this = no capacity
-ABANDON_S = 300
+# no pod and no /health worker this long = no capacity. TX-3 placed a pod 470 s after submit on 11-22,
+# and the program rule is "no workers for 15 min = stop"
+ABANDON_S = 900
 # a pod staging a large model is not RUNNING yet; only all-pods-exited this long counts as a stall
 STALL_S = 600
 # worker placed but waiting for a free GPU on its machine; the program rule is "no workers for 15 min = stop"
