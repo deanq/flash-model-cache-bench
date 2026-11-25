@@ -464,6 +464,17 @@ def test_interrupt_after_container_start_is_flagged_so_the_round_counts_as_s2():
     assert cut["container_started_before_teardown"] is True
 
 
+def test_s3_measure_records_whether_it_landed_on_the_interrupted_pods_machine():
+    # placement ignores the cache (DD 11-25 join), so every S3 redeploy must say where it landed
+    sc = spec.s3(dc="CA-MTL-1", gpu="a40", model="m/big", after_s=10)
+    _, lines, _, _ = _run(sc, start_after=200.0, machines=("7c66abc", "9zzz111"))
+    load = next(r for r in lines if r["kind"] == "load")
+    assert load["machine_id"] == "9zzz111" and load["same_machine_as_prev"] is False
+    _, lines, _, _ = _run(sc, start_after=200.0)
+    load = next(r for r in lines if r["kind"] == "load")
+    assert load["same_machine_as_prev"] is True
+
+
 def test_interrupt_with_no_worker_stops_and_cleans_up():
     sc = spec.s3(dc="US-TX-3", gpu="l40s", model="m/big", after_s=10)
     rp, lines, result, _ = _run(sc, never_place=True)

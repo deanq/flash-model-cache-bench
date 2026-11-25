@@ -143,6 +143,7 @@ class Driver:
         self._ctx = {"run_id": self.run_id, "scenario": sc.sid, "arm": sc.arm, "dc": sc.dc,
                      "gpu": sc.gpu, "model": sc.model}
         self._sc, self._n_eps, self._ep = sc, 0, None
+        self._cut_machine: str | None = None   # S3: the interrupted pod's machine, for the redeploy
         result = ScenarioResult(ok=True)
         try:
             self._create()
@@ -215,9 +216,11 @@ class Driver:
         self.rp.set_workers_max(ep, 0)
         self.rp.cancel(ep, jid)
         cut = self.now()
-        started = phases.epoch((self.rp.pods(ep).get(pod["id"]) or pod).get("lastStartedAt"))
+        now_pod = self.rp.pods(ep).get(pod["id"]) or pod
+        started = phases.epoch(now_pod.get("lastStartedAt"))
+        self._cut_machine = now_pod.get("machineId") or pod.get("machineId")
         self._emit({"kind": "interrupt", "step": i, "after_s": step.after_s, "job_id": jid,
-                    "pod_id": pod["id"], "machine_id": pod.get("machineId"),
+                    "pod_id": pod["id"], "machine_id": self._cut_machine,
                     "submitted_utc": phases.iso(submitted), "pod_created_utc": phases.iso(created),
                     "teardown_utc": phases.iso(cut), "pod_last_started_utc": phases.iso(started),
                     "teardown_after_pod_s": round(cut - created, 1),
@@ -279,7 +282,7 @@ class Driver:
         pod = seen.get(wid) or (self.rp.pods(ep).get(wid, {}) if wid in stale else {}) or watch.placed
         rec = phases.load_record(submitted=submitted, status={"id": jid, **status}, pod=pod,
                                  done_seen=self.now(), no_worker=failure == "no_worker")
-        last = next((r["machine_id"] for r in reversed(prev) if r.get("machine_id")), None)
+        last = next((r["machine_id"] for r in reversed(prev) if r.get("machine_id")), self._cut_machine)
         rec |= {"role": d.role, "step": i, "hold_s": d.hold_s, "failure": failure,
                 # resumed = an earlier worker restarted (same pod id), not a new pod placed for this load
                 "resumed": bool(rec["pod_reused"] or rec["pod_id"] in {r["pod_id"] for r in prev if r.get("pod_id")}),

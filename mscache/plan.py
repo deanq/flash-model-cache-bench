@@ -28,6 +28,9 @@ SIZE_GB = {"allenai/OLMo-2-1124-13B-Instruct": 27.4,
            "NousResearch/Hermes-3-Llama-3.1-70B": 141.1,
            "Qwen/Qwen2-Math-72B-Instruct": 145.4,
            "allenai/Llama-3.1-Tulu-3-70B-SFT": 141.1,
+           "deepseek-ai/DeepSeek-R1-Distill-Llama-70B": 141.1,
+           "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF": 141.1,
+           "allenai/Llama-3.1-Tulu-3-70B": 141.1,
            "01-ai/Yi-1.5-34B-Chat": 68.8,
            "Qwen/Qwen1.5-72B-Chat": 144.6,
            "abacusai/Smaug-72B-v0.1": 144.6,
@@ -49,8 +52,10 @@ M = {"S1": "Qwen/Qwen1.5-32B-Chat",
      "S10": "allenai/OLMo-2-0425-1B-Instruct",
      "S7": {"small": "ibm-granite/granite-3.1-2b-instruct", "medium": "Qwen/Qwen2.5-14B",
             "large": "Qwen/Qwen2-72B"},
-     "S3": {10: "NousResearch/Hermes-3-Llama-3.1-70B", 30: "Qwen/Qwen2-Math-72B-Instruct",
-            60: "allenai/Llama-3.1-Tulu-3-70B-SFT"},
+     # 11-25: the 11-22 S3 set was fully pulled in CA-MTL-1 and EU-SE-1, so LRU may still hold it and a cut
+     # would hit a cached copy; this set (all 141.1 GB, ungated) is new to every DC
+     "S3": {10: "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", 30: "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF",
+            60: "allenai/Llama-3.1-Tulu-3-70B"},
      "S4": "01-ai/Yi-1.5-34B-Chat",
      # 11-25: the 11-22/11-25 cold set (Qwen1.5-72B-Chat, Smaug-72B, Qwen2.5-72B) is now cached by LRU on
      # MTL and MO-1 machines, so a rerun there would not be cold; this set is new to every DC
