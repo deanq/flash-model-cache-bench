@@ -17,6 +17,9 @@ INTERRUPT_POLL_S = 1   # S3 cuts at pod_created + 10 s; a 5 s poll would blur th
 DONE = {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}
 GONE = {"EXITED", "TERMINATED"}
 LIVE_WORKERS = ("initializing", "running", "idle", "ready")
+RUNNING = ("IN_PROGRESS", "COMPLETED")   # handler up: the copy is staged on the host
+OFF_TARGET = "off_target"                # S5 warm placed off the cold machines; aborted and redeployed
+_BUSY_LOCK = threading.Lock()            # the busy table is shared by every Driver thread of a run
 
 
 class Client(Protocol):
@@ -41,16 +44,75 @@ class _Stop(Exception):
     """A load got no worker or stalled; stop the scenario cleanly."""
 
 
+class _Watch:
+    """One load's per-poll side effects: the S4 signal, S5 busy marking and S5 co-land targeting."""
+
+    def __init__(self, drv: "Driver", d: spec.Deploy, abort_off_target: bool):
+        self.drv, self.d, self.abort = drv, d, abort_off_target
+        self.marked: dict[str, str] = {}   # pod id -> machine, while this load is busy under d.busy
+        self.released = False
+        self.co_landed: bool | None = None
+        self.placed: dict = {}   # the pod co_landed was judged on (an aborted job has no workerId)
+
+    def __call__(self, seen: dict[str, dict], status: dict) -> str | None:
+        running = status.get("status") in RUNNING
+        if self.d.signal and running:
+            self.drv._set(self.d.signal)
+        placed = sorted((p for p in seen.values() if p.get("machineId")),
+                        key=lambda p: phases.epoch(p.get("createdAt")) or 0)
+        if self.d.busy and not self.released:
+            for p in placed:
+                self._mark(p["id"], p["machineId"])
+            if running:
+                self.release()
+        if self.d.co_land and placed and self.co_landed is None:
+            self.placed = placed[0]
+            self.co_landed = self.placed["machineId"] in self.drv._busy_machines(self.d.co_land)
+            if not self.co_landed and self.abort:
+                return OFF_TARGET
+        return None
+
+    def _mark(self, pid: str, machine: str) -> None:
+        if pid in self.marked:
+            return
+        with _BUSY_LOCK:
+            self.drv.busy.setdefault(self.d.busy, {})[pid] = machine
+        self.marked[pid] = machine
+        self.drv._event("busy_on", tag=self.d.busy, pod_id=pid, machine_id=machine)
+        self.drv._set(self.d.busy)
+
+    def release(self) -> None:
+        """Staging is over (or the load ended): the machine no longer counts as busy for this load."""
+        self.released = True
+        for pid, machine in self.marked.items():
+            with _BUSY_LOCK:
+                self.drv.busy.get(self.d.busy, {}).pop(pid, None)
+            self.drv._event("busy_off", tag=self.d.busy, pod_id=pid, machine_id=machine)
+        self.marked = {}
+
+
 class Driver:
     def __init__(self, client: Client, *, run_id: str, sink: Callable[[dict], None],
                  now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
-                 signals: dict[str, threading.Event] | None = None):
+                 signals: dict[str, threading.Event] | None = None,
+                 busy: dict[str, dict[str, str]] | None = None):
         self.rp, self.run_id, self.sink, self.now, self.sleep = client, run_id, sink, now, sleep
-        # shared by every Driver of one run, so S4/S5 arms on separate endpoints can line up
+        # both shared by every Driver of one run, so S4/S5 arms on separate endpoints can line up:
+        # signals by tag; busy = tag -> {pod id: machine} of loads still staging (S5 cold pulls)
         self.signals = {} if signals is None else signals
+        self.busy = {} if busy is None else busy
 
     def _signal(self, tag: str) -> threading.Event:
         return self.signals.setdefault(tag, threading.Event())
+
+    def _set(self, tag: str) -> None:
+        if not self._signal(tag).is_set():
+            self._signal(tag).set()
+            self._event("signal", tag=tag)
+
+    def _busy_machines(self, tag: str) -> set[str]:
+        with _BUSY_LOCK:
+            return set(self.busy.get(tag, {}).values())
 
     # ------------------------------------------------------------ plumbing
     def _emit(self, rec: dict) -> dict:
@@ -104,17 +166,13 @@ class Driver:
                 self._cleanup()
                 self._create()
             case spec.Deploy():
-                result.loads.append(self._deploy(ep, i, step, result.loads))
+                self._deploy_tries(i, step, result.loads)
             case spec.Teardown():
-                self.rp.set_workers_max(ep, 0)
-                self._wait_no_live_pods(ep, "teardown")
+                self._teardown(ep)
             case spec.AwaitScaleDown():
                 self._wait_no_live_pods(ep, "scale_down")
             case spec.Interrupt():
                 self._interrupt(ep, i, step)
-            case spec.Signal(tag=tag):
-                self._signal(tag).set()
-                self._event("signal", tag=tag)
             case spec.Await(tag=tag):
                 self._await(tag)
             case spec.Idle(seconds=s):
@@ -172,46 +230,73 @@ class Driver:
             self.sleep(POLL_S)
         self._event(f"{what}_timeout", live=[k for k, p in self.rp.pods(ep).items() if p["desiredStatus"] not in GONE])
 
+    def _teardown(self, ep: str) -> None:
+        self.rp.set_workers_max(ep, 0)
+        self._wait_no_live_pods(ep, "teardown")
+
     # ------------------------------------------------------------- deploy
-    def _deploy(self, ep: str, i: int, d: spec.Deploy, prev: list[dict]) -> dict:
+    def _deploy_tries(self, i: int, d: spec.Deploy, loads: list[dict]) -> None:
+        """One load, or up to d.tries placements when it targets busy machines (S5 warm). A miss is
+        aborted at placement, torn down, and redeployed on a fresh endpoint; the last try always runs."""
+        for attempt in range(1, d.tries + 1):
+            rec = self._deploy(self._ep, i, d, loads, attempt=attempt, abort_off_target=attempt < d.tries)
+            loads.append(rec)
+            if rec["failure"] != OFF_TARGET:
+                return
+            self._teardown(self._ep)
+            self._cleanup()
+            self._create()
+
+    def _deploy(self, ep: str, i: int, d: spec.Deploy, prev: list[dict], *,
+                attempt: int = 1, abort_off_target: bool = False) -> dict:
         stale = set(self.rp.pods(ep))          # pods listed from earlier rounds are not this load's
         if d.scale_up:
             self.rp.set_workers_max(ep, 1)
         submitted = self.now()
         jid = self.rp.submit(ep, {"hold_s": d.hold_s})
-        status, seen, failure = self._poll(ep, jid, submitted, stale, d.signal)
+        watch = _Watch(self, d, abort_off_target)
+        try:
+            status, seen, failure = self._poll(ep, jid, submitted, stale, watch)
+        finally:
+            watch.release()   # a stopped or failed cold load must not stay busy for the warm arm
         wid = status.get("workerId") or ""
         # a worker stopped by idle timeout restarts under its old pod id, so it is in `stale`
-        pod = seen.get(wid) or (self.rp.pods(ep).get(wid, {}) if wid in stale else {})
+        pod = seen.get(wid) or (self.rp.pods(ep).get(wid, {}) if wid in stale else {}) or watch.placed
         rec = phases.load_record(submitted=submitted, status={"id": jid, **status}, pod=pod,
                                  done_seen=self.now(), no_worker=failure == "no_worker")
         last = next((r["machine_id"] for r in reversed(prev) if r.get("machine_id")), None)
         rec |= {"role": d.role, "step": i, "hold_s": d.hold_s, "failure": failure,
                 # resumed = an earlier worker restarted (same pod id), not a new pod placed for this load
                 "resumed": bool(rec["pod_reused"] or rec["pod_id"] in {r["pod_id"] for r in prev if r.get("pod_id")}),
-                "same_machine_as_prev": (rec["machine_id"] == last) if last and rec["machine_id"] else None}
+                "same_machine_as_prev": (rec["machine_id"] == last) if last and rec["machine_id"] else None,
+                "attempt": attempt,
+                # S5 warm: placed on a machine where a cold pull was still staging (None: not targeted)
+                "co_landed": watch.co_landed if d.co_land else None}
+        if failure == OFF_TARGET:
+            rec |= {"outcome": OFF_TARGET, "outcome_estimated": False, "outcome_rule": None}
         rec = self._emit(rec)
         for pid, p in seen.items():
             if pid != rec["pod_id"]:
                 self._emit({"kind": "pod_only", "step": i, "pod_id": pid, "machine_id": p.get("machineId"),
                             "pod_created_utc": phases.iso(phases.epoch(p.get("createdAt"))),
                             "pod_last_started_utc": phases.iso(phases.epoch(p.get("lastStartedAt")))})
-        if failure:
+        if failure and failure != OFF_TARGET:
             raise _Stop(f"{failure} at step {i} ({rec['outcome']})")
         return rec
 
     def _poll(self, ep: str, jid: str, submitted: float, stale: set[str],
-              signal: str | None = None) -> tuple[dict, dict, str | None]:
-        """(final status, this load's pods by id, failure or None). `signal` is set once the job runs."""
+              watch: Callable[[dict, dict], str | None]) -> tuple[dict, dict, str | None]:
+        """(final status, this load's pods by id, failure or None). `watch` sees every poll and may abort."""
         seen: dict[str, dict] = {}
         clocks = {"live": None, "throttled": None}   # first-seen times; live None = nothing placed yet
         while True:
             self.sleep(POLL_S)
             seen |= {k: v for k, v in self.rp.pods(ep).items() if k not in stale}
             status = self.rp.status(ep, jid)
-            if signal and status.get("status") in ("IN_PROGRESS", "COMPLETED") and not self._signal(signal).is_set():
-                self._signal(signal).set()
-                self._event("signal", tag=signal)
+            aborted = watch(seen, status)
+            if aborted:
+                self.rp.cancel(ep, jid)
+                return {**status, "status": "CANCELLED"}, seen, aborted
             if status.get("status") in DONE:
                 return status, seen, None if status["status"] == "COMPLETED" else "job_" + status["status"].lower()
             t = self.now()

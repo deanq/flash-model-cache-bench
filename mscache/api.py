@@ -82,5 +82,7 @@ class LiveClient:
         eps = self.rp.graphql(PODS_QUERY)["myself"]["endpoints"]
         return {p["id"]: p for e in eps if e["id"] == ep for p in e["pods"] or []}
 
-    def leftovers(self) -> list[dict]:
-        return [e for e in self.rp.list_endpoints() if e["name"].startswith(spec.NAME_PREFIX)]
+    def leftovers(self, dc: str | None = None) -> list[dict]:
+        """msc-* endpoints, only `dc`'s if given (parallel per-DC runs must not report each other's)."""
+        prefix = spec.dc_prefix(dc) if dc else spec.NAME_PREFIX
+        return [e for e in self.rp.list_endpoints() if e["name"].startswith(prefix)]

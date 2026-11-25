@@ -25,12 +25,20 @@ SETTLE_S = 60
 IDLE_TIMEOUT_S = 5
 # S4 holder keeps its worker while the peers place (ready + 2 min settle + ~1-3 min placement)
 S4_HOLD_S = 300
-# S5+: the cold pulls get this head start, so the warm deploy lands while they hold the download slots
+# S5+: after the first cold pod is placed, the others get this long to place before warm deploys
 S5_WARM_DELAY_S = 30
+# 11-22: warm and cold landed on different machines; the customer path cannot pin a machine, so warm
+# redeploys until it lands on a cold machine. 3 placements bound the extra spend (~$0.2-0.5)
+S5_CO_LAND_TRIES = 3
 AWAIT_TIMEOUT_S = ROUND_TIMEOUT_S
 SIZES = ("small", "medium", "large")   # <10 GB, 20-40 GB, 100+ GB
 # org/name, optionally :revision (S8 points one at a commit that does not exist)
 _REPO = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+(:[\w.-]+)?$")
+
+
+def dc_prefix(dc: str) -> str:
+    """Every endpoint name of a DC starts with this (US-MO-1 -> msc-mo1-), so leftovers scope to one DC."""
+    return f"{NAME_PREFIX}{dc.lower().replace('us-', '').replace('-', '')}-"
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,12 @@ class Deploy:
     hold_s: int
     scale_up: bool = True      # False: workersMax stays put, the job itself triggers scale-from-zero
     signal: str | None = None  # set this tag once the job is running (handler up, copy on the host)
+    # S5: while this load stages, its machine is busy under the tag (and the tag is signalled at placement)
+    busy: str | None = None
+    # S5: target the machines busy under the tag; a load placed elsewhere is aborted and redeployed on a
+    # fresh endpoint, up to `tries` placements (the last one runs whatever machine it lands on)
+    co_land: str | None = None
+    tries: int = 1
 
 
 @dataclass(frozen=True)
@@ -86,14 +100,9 @@ class Interrupt:
 
 
 @dataclass(frozen=True)
-class Signal:
-    """Set a tag other scenarios of the same run can Await."""
-    tag: str
-
-
-@dataclass(frozen=True)
 class Await:
-    """Wait (endpoint at 0 workers, $0) until another scenario sets the tag; AWAIT_TIMEOUT_S ends it."""
+    """Wait (endpoint at 0 workers, $0) until another scenario's Deploy sets the tag (Deploy.signal at
+    job start, Deploy.busy at placement); AWAIT_TIMEOUT_S ends it."""
     tag: str
 
 
@@ -102,7 +111,7 @@ class Idle:
     seconds: int
 
 
-Step = Deploy | Teardown | AwaitScaleDown | Recreate | Interrupt | Signal | Await | Idle
+Step = Deploy | Teardown | AwaitScaleDown | Recreate | Interrupt | Await | Idle
 
 
 @dataclass(frozen=True)
@@ -122,9 +131,8 @@ class Scenario:
 
     def endpoint_name(self, run_id: str, n: int = 0) -> str:
         """n > 0 names the n-th recreated endpoint of the scenario."""
-        dc = self.dc.lower().replace("us-", "").replace("-", "")
         suffix = f"-{n}" if n else ""
-        return f"{NAME_PREFIX}{dc}-{self.sid.lower()}{self.arm}-{self.gpu}-{run_id}"[:60 - len(suffix)] + suffix
+        return f"{dc_prefix(self.dc)}{self.sid.lower()}{self.arm}-{self.gpu}-{run_id}"[:60 - len(suffix)] + suffix
 
     @property
     def deploys(self) -> list[Deploy]:
@@ -199,13 +207,16 @@ def s4(*, dc: str, gpu: str, model: str, peers: int = 3) -> list[Scenario]:
 
 def s5(*, dc: str, gpu: str, cold: list[str], warm: str | None = None) -> list[Scenario]:
     """Slot contention: cold pulls of different large models at once (they co-land, as in the pilot).
-    S5+ (warm given): a cached model redeploys while the cold pulls hold the host's 4 download slots."""
+    S5+ (warm given): a cached model redeploys while the cold pulls hold the host's 4 download slots.
+    The cold pulls start first and mark their machines busy; warm seeds until it lands on one of them
+    (S5_CO_LAND_TRIES), then redeploys there while they still stage. Each warm load records co_landed."""
     if warm is None:
         return [Scenario("S5", f"cold{n}", dc, gpu, m, (Deploy("cold", READY_HOLD_S),))
                 for n, m in enumerate(cold, 1)]
     tag = f"S5:{warm}"
     warm_sc = Scenario("S5", "warm", dc, gpu, warm,
-                       (Deploy("seed", READY_HOLD_S), Teardown(), Recreate(), Signal(tag),
-                        Idle(S5_WARM_DELAY_S), Deploy("measure", READY_HOLD_S)))
-    return [warm_sc, *(Scenario("S5", f"cold{n}", dc, gpu, m, (Await(tag), Deploy("cold", READY_HOLD_S)))
+                       (Await(tag), Idle(S5_WARM_DELAY_S),
+                        Deploy("seed", READY_HOLD_S, co_land=tag, tries=S5_CO_LAND_TRIES),
+                        Teardown(), Recreate(), Deploy("measure", READY_HOLD_S, co_land=tag)))
+    return [warm_sc, *(Scenario("S5", f"cold{n}", dc, gpu, m, (Deploy("cold", READY_HOLD_S, busy=tag),))
                        for n, m in enumerate(cold, 1))]

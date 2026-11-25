@@ -13,6 +13,8 @@ from pathlib import PurePosixPath
 
 # cached loads stage in 2-5 s, or 45-60 s when the ai-api wait lands here; cold pulls ran 130 s+
 CACHED_STAGING_MAX_S = 75
+OUTCOME_RULE = f"staging_s <= {CACHED_STAGING_MAX_S} s"
+ESTIMATED_OUTCOMES = frozenset({"cached", "pull"})
 # ai-api's scale-from-zero floor (40 s min queue time) lands 42-50 s after submit (11-22 joined read);
 # a cached load whose container starts this late is ai-api time, not copy time
 FLOOR_MIN_S = 38
@@ -76,6 +78,8 @@ def load_record(*, submitted: float, status: dict, pod: dict, done_seen: float, 
                if t["container_start"] is not None and anchor is not None else None)
     snapshot = out.get("snapshot")
     machine = pod.get("machine") or {}
+    outcome = _outcome(status.get("status"), staging, no_worker)
+    estimated = outcome in ESTIMATED_OUTCOMES
     return {
         "kind": "load",
         "status": status.get("status"),
@@ -100,6 +104,10 @@ def load_record(*, submitted: float, status: dict, pod: dict, done_seen: float, 
         "staging_from": None if anchor is None else ("submit" if reused else "pod_created"),
         "submit_to_container_s": (round(t["container_start"] - submitted, 1)
                                   if t["container_start"] is not None else None),
-        "outcome": _outcome(status.get("status"), staging, no_worker),
+        "outcome": outcome,
+        # cached/pull come from the staging cutoff only (73y4 11-22: a 24 s pull read as cached);
+        # the main Mac's host-log join decides. no_worker/failed are observed, not estimated.
+        "outcome_estimated": estimated,
+        "outcome_rule": OUTCOME_RULE if estimated else None,
         "error": status.get("error"),
     }

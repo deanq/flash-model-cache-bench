@@ -22,6 +22,11 @@ def _submit_to_container(r: dict) -> float | None:
     return r.get("submit_to_container_s", r["offsets_s"].get("container_start"))
 
 
+def _outcome(r: dict) -> str:
+    """cached/pull are staging-cutoff estimates; the host-log join is final."""
+    return f"{r['outcome']} (est.)" if r.get("outcome_estimated") else r["outcome"]
+
+
 def _scenario(key: tuple[str, str], recs: list[dict]) -> list[str]:
     loads = [r for r in recs if r["kind"] == "load"]
     measure = [r for r in loads if r["role"] == "measure"]
@@ -30,7 +35,7 @@ def _scenario(key: tuple[str, str], recs: list[dict]) -> list[str]:
     floor = [r for r in measure if r.get("floor_wait")]
     staging = [r["staging_s"] for r in measure if r["staging_s"] is not None and not r.get("floor_wait")]
     to_container = [x for x in map(_submit_to_container, measure) if x is not None]
-    outcomes = Counter(r["outcome"] for r in measure)
+    outcomes = Counter(_outcome(r) for r in measure)
     same = Counter(r["same_machine_as_prev"] for r in measure)
     resumed = Counter(bool(r.get("resumed")) for r in measure)
     taint = sum(r["kind"] == "pod_only" for r in recs)
@@ -53,7 +58,7 @@ def _join_rows(recs: list[dict]) -> list[str]:
     for r in (r for r in recs if r["kind"] == "load"):
         gb = f"{r['staged_bytes'] / 1e9:.1f}" if r.get("staged_bytes") else ""
         worker = "resumed" if r.get("resumed") else "new"
-        outcome = f"{r['outcome']} (ai-api floor)" if r.get("floor_wait") else r["outcome"]
+        outcome = _outcome(r) + (" (ai-api floor)" if r.get("floor_wait") else "")
         staging = f"{r['staging_s']} (from {_staging_from(r)})" if r.get("staging_s") is not None else ""
         cells = [f"{r['scenario']} {r['arm']}".strip(), r["role"], r["endpoint_id"], r["pod_id"], worker,
                  r["machine_id"], r["model"], r["revision"], gb, outcome, staging, _submit_to_container(r),

@@ -1,9 +1,11 @@
 """MSCACHE harness: scenario specs, phase records, cost, and the driver against a fake Runpod."""
 import json
+import threading
 
 import pytest
 
 from mscache import cost, phases, spec
+from mscache.api import LiveClient
 from mscache.driver import Driver, ScenarioResult
 
 T0 = 1_700_000_000.0
@@ -433,12 +435,11 @@ def test_s4_holder_signals_ready_and_peers_wait_for_the_copy_to_settle():
         assert p.steps[1].seconds == spec.READY_HOLD_S and p.model == "m/a"
 
 
-def test_s5_plus_warm_redeploy_starts_while_the_cold_pulls_run():
+def test_s5_arms_and_models():
     scs = spec.s5(dc="US-TX-3", gpu="l40s", cold=["m/c1", "m/c2"], warm="m/w")
     warm, *cold = scs
     assert warm.arm == "warm" and [c.arm for c in cold] == ["cold1", "cold2"]
-    assert _kinds(warm) == ["Deploy", "Teardown", "Recreate", "Signal", "Idle", "Deploy"]
-    assert all(_kinds(c) == ["Await", "Deploy"] and c.deploys[0].role == "cold" for c in cold)
+    assert all(c.deploys[0].role == "cold" for c in cold)
     assert len({s.model for s in scs}) == 3
     assert [c.arm for c in spec.s5(dc="US-TX-3", gpu="l40s", cold=["m/c1", "m/c2", "m/c3"])] == \
         ["cold1", "cold2", "cold3"]
@@ -542,7 +543,7 @@ def test_report_summarizes_measure_loads_median_and_worst():
     text = report.render(lines)
     assert "S2 gap60" in text and "measure loads: 3" in text
     assert "median" in text and "worst" in text and "ep1" in text
-    assert "outcomes: cached=3" in text
+    assert "outcomes: cached (est.)=3" in text
 
 
 def test_report_keeps_ai_api_floor_loads_out_of_staging_and_counts_resumes():
@@ -560,7 +561,7 @@ def test_report_keeps_ai_api_floor_loads_out_of_staging_and_counts_resumes():
     assert "new pod=2 resumed (same pod id)=1" in text
     assert ", ".join(dict.fromkeys(r["endpoint_id"] for r in loads)) in text
     assert len({r["endpoint_id"] for r in loads}) == 4
-    assert "cached (ai-api floor)" in text
+    assert "cached (est.) (ai-api floor)" in text
 
 
 # ------------------------------------------------------------- matrix plan
@@ -633,3 +634,110 @@ def test_cli_execute_runs_lanes_in_parallel_and_batches_in_order():
     assert len(out) == len(_scs(lanes)) and all(r.ok for _, r in out)
     s4 = [k for k in order if k.startswith("S4")]
     assert order.index(s4[-1]) < order.index("S5warm")   # S5 batch starts after the S4 batch is done
+
+
+# ------------------------------------------- 11-24 fixes before the v4.9.0 run
+@pytest.mark.parametrize("staging,want", [(4, "cached"), (139, "pull")])
+def test_cutoff_outcome_is_marked_as_an_estimate_for_the_host_join(staging, want):
+    # 73y4 16:54 (11-22): a 24 s origin pull read as cached by the cutoff; only the host join can tell
+    out = _output(container_start=T0 + 1 + staging, handler_start=T0 + 2 + staging, now=T0 + 3 + staging)
+    rec = phases.load_record(submitted=T0, status={"status": "COMPLETED", "workerId": "pod1", "output": out},
+                             pod=_pod(), done_seen=T0 + 200)
+    assert rec["outcome"] == want and rec["outcome_estimated"] is True
+    assert rec["outcome_rule"] == f"staging_s <= {phases.CACHED_STAGING_MAX_S} s"
+
+
+def test_failure_outcomes_are_observed_not_estimated():
+    nw = phases.load_record(submitted=T0, status={"status": "CANCELLED"}, pod={}, done_seen=T0 + 300, no_worker=True)
+    assert nw["outcome_estimated"] is False and nw["outcome_rule"] is None
+
+
+def test_report_labels_cutoff_outcomes_as_estimates():
+    sc = spec.s2(dc="CA-MTL-1", gpu="a40", model="m/a", gap_s=60, repeats=1)
+    _, lines, _, _ = _run(sc)
+    text = report.render(lines)
+    assert "| cached (est.) |" in text and "outcomes: cached (est.)=1" in text
+
+
+def test_leftovers_are_scoped_to_the_runs_dc():
+    class Rp:
+        def list_endpoints(self):
+            return [{"id": "a", "name": "msc-camtl1-s2gap600-a40-11241200"},
+                    {"id": "b", "name": "msc-mo1-s4holder-l40s-11241200"},
+                    {"id": "c", "name": "other-endpoint"}]
+    live = LiveClient(Rp())
+    assert [e["id"] for e in live.leftovers("CA-MTL-1")] == ["a"]
+    assert [e["id"] for e in live.leftovers("US-MO-1")] == ["b"]
+    assert [e["id"] for e in live.leftovers()] == ["a", "b"]
+
+
+def test_dc_prefix_is_the_start_of_every_endpoint_name_in_that_dc():
+    sc = spec.s1(dc="US-MO-1", gpu="l40s", model="m/a")
+    assert spec.dc_prefix("US-MO-1") == "msc-mo1-"
+    assert sc.endpoint_name("r1").startswith(spec.dc_prefix("US-MO-1"))
+
+
+def test_s5_starts_cold_first_and_warm_targets_their_machines():
+    warm, *cold = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1", "m/c2"], warm="m/w")
+    tag = "S5:m/w"
+    assert all(_kinds(c) == ["Deploy"] and c.deploys[0].busy == tag for c in cold)
+    assert _kinds(warm) == ["Await", "Idle", "Deploy", "Teardown", "Recreate", "Deploy"]
+    seed, measure = warm.deploys
+    assert seed.role == "seed" and seed.co_land == tag and seed.tries == spec.S5_CO_LAND_TRIES == 3
+    assert measure.role == "measure" and measure.co_land == tag and measure.tries == 1
+
+
+def test_cost_counts_the_worst_case_aborted_co_land_tries():
+    warm, *_ = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1"], warm="m/w")
+    one_try = spec.Scenario(warm.sid, warm.arm, warm.dc, warm.gpu, warm.model,
+                            tuple(spec.Deploy(s.role, s.hold_s, co_land=s.co_land) if isinstance(s, spec.Deploy)
+                                  else s for s in warm.steps))
+    three, one = cost.estimate(warm, size_gb=64), cost.estimate(one_try, size_gb=64)
+    extra = spec.S5_CO_LAND_TRIES - 1
+    assert three.likely_worker_s - one.likely_worker_s == pytest.approx(extra * cost.ABORTED_TRY_S)
+    assert three.worst_worker_s - one.worst_worker_s == pytest.approx(extra * cost.ABORTED_TRY_S)
+    assert three.wall_s - one.wall_s == pytest.approx(extra * (cost.ABORTED_TRY_S + cost.TEARDOWN_WALL_S))
+    assert three.loads == one.loads + extra
+
+
+def _warm_run(machines, busy):
+    warm, *_ = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1"], warm="m/w")
+    clock = FakeClock()
+    rp = FakeRunpod(clock, machines=machines)
+    signals, lines = {"S5:m/w": threading.Event()}, []
+    signals["S5:m/w"].set()
+    result = Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep, signals=signals,
+                    busy={"S5:m/w": dict(busy)}).run(warm)
+    return rp, [r for r in lines if r["kind"] == "load"], result
+
+
+def test_warm_seed_redeploys_until_it_lands_on_a_cold_pull_machine():
+    rp, loads, result = _warm_run(("mA", "mA", "mB"), {"coldpod": "mB"})
+    assert result.ok
+    assert [(r["role"], r["machine_id"], r["co_landed"], r["attempt"]) for r in loads] == [
+        ("seed", "mA", False, 1), ("seed", "mA", False, 2), ("seed", "mB", True, 3), ("measure", "mB", True, 1)]
+    assert [r["failure"] for r in loads] == ["off_target", "off_target", None, None]
+    # each miss is torn down and redeployed on a fresh endpoint; nothing is left behind
+    assert rp.created == [f"msc-camtl1-s5warm-a40-t1{s}" for s in ("", "-1", "-2", "-3")]
+    assert sorted(rp.deleted) == ["ep1", "ep2", "ep3", "ep4"]
+
+
+def test_warm_seed_gives_up_after_three_tries_and_records_not_co_landed():
+    rp, loads, result = _warm_run(("mA",), {"coldpod": "mB"})
+    assert result.ok
+    assert [(r["role"], r["co_landed"], r["failure"]) for r in loads] == [
+        ("seed", False, "off_target"), ("seed", False, "off_target"), ("seed", False, None), ("measure", False, None)]
+    assert len(rp.created) == 4 and len(rp.deleted) == 4
+
+
+def test_cold_load_marks_its_machine_busy_until_staging_ends_and_releases_the_warm_arm():
+    _, *cold = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1"], warm="m/w")
+    clock = FakeClock()
+    rp = FakeRunpod(clock, machines=("mB",))
+    signals, busy, lines = {}, {}, []
+    Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep, signals=signals,
+           busy=busy).run(cold[0])
+    assert signals["S5:m/w"].is_set()
+    ev = [(r["event"], r.get("machine_id")) for r in lines if r.get("event", "").startswith("busy")]
+    assert ev == [("busy_on", "mB"), ("busy_off", "mB")]
+    assert busy["S5:m/w"] == {}

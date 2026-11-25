@@ -4,7 +4,7 @@
   python -m mscache smoke --dc CA-MTL-1 --gpu a40 [--window 1|2 | --control]   create+delete each endpoint, $0
   python -m mscache run   --dc CA-MTL-1 --gpu a40 [--window 1|2 | --control] --spend   PAID
   python -m mscache report runs/mscache/<run_id>            re-render a report
-  python -m mscache leftovers                               list msc-* endpoints (should be none)
+  python -m mscache leftovers [--dc CA-MTL-1]               list msc-* endpoints, one DC's if given (should be none)
 
 No --window/--control = the pilot (S2 60 s/600 s + S9). A plan is lanes -> batches -> scenarios:
 lanes run in parallel, batches in a lane one after another, scenarios in a batch in parallel.
@@ -110,8 +110,9 @@ def _run(args) -> int:
                   f"{rec.get('event') or rec.get('outcome') or rec['kind']} "
                   f"{rec.get('machine_id') or ''} {rec.get('offsets_s', '')}", flush=True)
 
-    live, signals = LiveClient(), {}   # one signal table per run: S4/S5 arms line up through it
-    results = _execute(lanes, lambda: Driver(live, run_id=run_id, sink=sink, signals=signals))
+    # one signal table and one busy table per run: S4/S5 arms line up through them
+    live, signals, busy = LiveClient(), {}, {}
+    results = _execute(lanes, lambda: Driver(live, run_id=run_id, sink=sink, signals=signals, busy=busy))
     for s, r in results:
         print(f"RESULT {_key(s)} ok={r.ok} {r.reason}")
     recs = [json.loads(line) for line in path.open()]
@@ -126,9 +127,11 @@ def _report(args) -> int:
     return 0
 
 
-def _leftovers(_args) -> int:
-    left = LiveClient().leftovers()
-    print("leftovers:", left or "none")
+def _leftovers(args) -> int:
+    # smoke and run pass their own --dc: a parallel run in another DC is not this run's leftover
+    dc = getattr(args, "dc", None)
+    left = LiveClient().leftovers(dc)
+    print(f"leftovers ({dc or 'all DCs'}):", left or "none")
     return 1 if left else 0
 
 
@@ -147,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             sp.add_argument("--spend", action="store_true")
             sp.add_argument("--serial", action="store_true", help="pilot only: one scenario at a time")
     sub.add_parser("report").add_argument("run_dir")
-    sub.add_parser("leftovers")
+    sub.add_parser("leftovers").add_argument("--dc", help="only this DC's msc-* endpoints")
     args = p.parse_args(argv)
     return {"plan": _plan, "smoke": _smoke, "run": _run, "report": _report, "leftovers": _leftovers}[args.cmd](args)
 
