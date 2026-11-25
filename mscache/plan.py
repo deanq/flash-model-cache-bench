@@ -32,6 +32,9 @@ SIZE_GB = {"allenai/OLMo-2-1124-13B-Instruct": 27.4,
            "Qwen/Qwen1.5-72B-Chat": 144.6,
            "abacusai/Smaug-72B-v0.1": 144.6,
            "Qwen/Qwen2.5-72B": 145.4,
+           "Qwen/Qwen2.5-72B-Instruct": 145.4,
+           "Qwen/Qwen2-72B-Instruct": 145.4,
+           "Qwen/Qwen2.5-Math-72B-Instruct": 145.4,
            "allenai/OLMo-2-0325-32B-Instruct": 64.5,
            "meta-llama/Llama-3.1-8B": 32.1}
 FAILURE_SIZE_GB = 1.0      # S8 loads fail before (or instead of) a pull
@@ -49,7 +52,9 @@ M = {"S1": "Qwen/Qwen1.5-32B-Chat",
      "S3": {10: "NousResearch/Hermes-3-Llama-3.1-70B", 30: "Qwen/Qwen2-Math-72B-Instruct",
             60: "allenai/Llama-3.1-Tulu-3-70B-SFT"},
      "S4": "01-ai/Yi-1.5-34B-Chat",
-     "S5_cold": ("Qwen/Qwen1.5-72B-Chat", "abacusai/Smaug-72B-v0.1", "Qwen/Qwen2.5-72B"),
+     # 11-25: the 11-22/11-25 cold set (Qwen1.5-72B-Chat, Smaug-72B, Qwen2.5-72B) is now cached by LRU on
+     # MTL and MO-1 machines, so a rerun there would not be cold; this set is new to every DC
+     "S5_cold": ("Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen2-72B-Instruct", "Qwen/Qwen2.5-Math-72B-Instruct"),
      "S5_warm": "allenai/OLMo-2-0325-32B-Instruct",
      "S8_gated": "meta-llama/Llama-3.1-8B",
      "S8_badrev": "allenai/OLMo-2-0425-1B-Instruct:" + "0" * 40}

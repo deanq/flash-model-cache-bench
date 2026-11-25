@@ -25,11 +25,14 @@ SETTLE_S = 60
 IDLE_TIMEOUT_S = 5
 # S4 holder keeps its worker while the peers place (ready + 2 min settle + ~1-3 min placement)
 S4_HOLD_S = 300
-# S5+: after the first cold pod is placed, the others get this long to place before warm deploys
+# S5+: after the first cold pull lands on the seed's machine, the others get this long before warm deploys
 S5_WARM_DELAY_S = 30
-# 11-22: warm and cold landed on different machines; the customer path cannot pin a machine, so warm
-# redeploys until it lands on a cold machine. 3 placements bound the extra spend (~$0.2-0.5)
+# the customer path cannot pin a machine, so cold pulls and the warm measure redeploy until they land on
+# the seed's machine. 3 placements bound the extra spend (a miss is aborted at its first poll)
 S5_CO_LAND_TRIES = 3
+# 11-25 MO-1 l40s: a cold 72B pull and the warm load queued behind it both hit the 30 min round timeout;
+# the wait itself is the S5 finding, so S5 loads get longer before they count as failed
+S5_ROUND_TIMEOUT_S = 45 * 60
 AWAIT_TIMEOUT_S = ROUND_TIMEOUT_S
 SIZES = ("small", "medium", "large")   # <10 GB, 20-40 GB, 100+ GB
 # org/name, optionally :revision (S8 points one at a commit that does not exist)
@@ -72,6 +75,10 @@ class Deploy:
     # fresh endpoint, up to `tries` placements (the last one runs whatever machine it lands on)
     co_land: str | None = None
     tries: int = 1
+    # S5: record this load's machine under the tag for others to co_land on (kept after the load ends);
+    # the tag is signalled once the job is running (the copy is staged on that machine)
+    pin: str | None = None
+    timeout_s: int = ROUND_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -102,7 +109,7 @@ class Interrupt:
 @dataclass(frozen=True)
 class Await:
     """Wait (endpoint at 0 workers, $0) until another scenario's Deploy sets the tag (Deploy.signal at
-    job start, Deploy.busy at placement); AWAIT_TIMEOUT_S ends it."""
+    job start, Deploy.busy at placement, Deploy.pin at job start); AWAIT_TIMEOUT_S ends it."""
     tag: str
 
 
@@ -207,16 +214,22 @@ def s4(*, dc: str, gpu: str, model: str, peers: int = 3) -> list[Scenario]:
 
 def s5(*, dc: str, gpu: str, cold: list[str], warm: str | None = None) -> list[Scenario]:
     """Slot contention: cold pulls of different large models at once (they co-land, as in the pilot).
-    S5+ (warm given): a cached model redeploys while the cold pulls hold the host's 4 download slots.
-    The cold pulls start first and mark their machines busy; warm seeds until it lands on one of them
-    (S5_CO_LAND_TRIES), then redeploys there while they still stage. Each warm load records co_landed."""
+    S5+ (warm given): a cached model redeploys while cold pulls hold its machine's download slots.
+    11-25: seeding warm after the cold pulls queued the seed behind them, so the measure came too late.
+    Now the warm seed goes first and pins its machine; once its copy is staged the cold pulls redeploy
+    until they land there (marking it busy while they stage), then the warm measure redeploys until it
+    lands on a machine still busy. Every load records attempt + co_landed."""
     if warm is None:
         return [Scenario("S5", f"cold{n}", dc, gpu, m, (Deploy("cold", READY_HOLD_S),))
                 for n, m in enumerate(cold, 1)]
-    tag = f"S5:{warm}"
+    home, busy = f"S5home:{warm}", f"S5:{warm}"
     warm_sc = Scenario("S5", "warm", dc, gpu, warm,
-                       (Await(tag), Idle(S5_WARM_DELAY_S),
-                        Deploy("seed", READY_HOLD_S, co_land=tag, tries=S5_CO_LAND_TRIES),
-                        Teardown(), Recreate(), Deploy("measure", READY_HOLD_S, co_land=tag)))
-    return [warm_sc, *(Scenario("S5", f"cold{n}", dc, gpu, m, (Deploy("cold", READY_HOLD_S, busy=tag),))
-                       for n, m in enumerate(cold, 1))]
+                       (Deploy("seed", READY_HOLD_S, pin=home, timeout_s=S5_ROUND_TIMEOUT_S),
+                        Teardown(), Recreate(), Await(busy), Idle(S5_WARM_DELAY_S),
+                        Deploy("measure", READY_HOLD_S, co_land=busy, tries=S5_CO_LAND_TRIES,
+                               timeout_s=S5_ROUND_TIMEOUT_S)))
+    colds = [Scenario("S5", f"cold{n}", dc, gpu, m,
+                      (Await(home), Deploy("cold", READY_HOLD_S, busy=busy, co_land=home, tries=S5_CO_LAND_TRIES,
+                                           timeout_s=S5_ROUND_TIMEOUT_S)))
+             for n, m in enumerate(cold, 1)]
+    return [warm_sc, *colds]

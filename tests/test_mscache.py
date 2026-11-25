@@ -677,14 +677,23 @@ def test_dc_prefix_is_the_start_of_every_endpoint_name_in_that_dc():
     assert sc.endpoint_name("r1").startswith(spec.dc_prefix("US-MO-1"))
 
 
-def test_s5_starts_cold_first_and_warm_targets_their_machines():
+HOME, BUSY = "S5home:m/w", "S5:m/w"
+
+
+def test_s5_seeds_warm_first_then_cold_pulls_and_warm_measure_co_land_on_its_machine():
     warm, *cold = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1", "m/c2"], warm="m/w")
-    tag = "S5:m/w"
-    assert all(_kinds(c) == ["Deploy"] and c.deploys[0].busy == tag for c in cold)
-    assert _kinds(warm) == ["Await", "Idle", "Deploy", "Teardown", "Recreate", "Deploy"]
+    assert _kinds(warm) == ["Deploy", "Teardown", "Recreate", "Await", "Idle", "Deploy"]
     seed, measure = warm.deploys
-    assert seed.role == "seed" and seed.co_land == tag and seed.tries == spec.S5_CO_LAND_TRIES == 3
-    assert measure.role == "measure" and measure.co_land == tag and measure.tries == 1
+    assert (seed.role, seed.pin, seed.co_land, seed.tries) == ("seed", HOME, None, 1)
+    assert warm.steps[3].tag == BUSY
+    assert (measure.role, measure.co_land, measure.tries) == ("measure", BUSY, spec.S5_CO_LAND_TRIES)
+    for c in cold:
+        assert _kinds(c) == ["Await", "Deploy"] and c.steps[0].tag == HOME
+        d = c.deploys[0]
+        assert (d.role, d.co_land, d.busy, d.tries) == ("cold", HOME, BUSY, spec.S5_CO_LAND_TRIES)
+    # 11-25 MO-1: a cold 72B pull and the queued warm load both hit the 30 min round timeout
+    assert all(d.timeout_s == spec.S5_ROUND_TIMEOUT_S > spec.ROUND_TIMEOUT_S
+               for sc in (warm, *cold) for d in sc.deploys)
 
 
 def test_cost_counts_the_worst_case_aborted_co_land_tries():
@@ -700,44 +709,85 @@ def test_cost_counts_the_worst_case_aborted_co_land_tries():
     assert three.loads == one.loads + extra
 
 
-def _warm_run(machines, busy):
-    warm, *_ = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1"], warm="m/w")
-    clock = FakeClock()
+def _driver(clock, rp, lines, signals, busy):
+    return Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep, signals=signals,
+                  busy=busy)
+
+
+def _set(tag):
+    ev = threading.Event()
+    ev.set()
+    return {tag: ev}
+
+
+def test_warm_seed_pins_its_machine_and_signals_once_its_copy_is_staged():
+    seed = spec.Scenario("S5", "warm", "CA-MTL-1", "a40", "m/w", (spec.Deploy("seed", 60, pin=HOME),))
+    clock, signals, busy, lines = FakeClock(), {}, {}, []
+    result = _driver(clock, FakeRunpod(clock, machines=("mH",)), lines, signals, busy).run(seed)
+    assert result.ok and signals[HOME].is_set()
+    # the pin outlives the seed load: cold pulls target this machine after the seed is torn down
+    assert set(busy[HOME].values()) == {"mH"}
+
+
+def _cold_run(machines):
+    _, *cold = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1"], warm="m/w")
+    clock, signals, busy, lines = FakeClock(), _set(HOME), {HOME: {"seedpod": "mH"}}, []
     rp = FakeRunpod(clock, machines=machines)
-    signals, lines = {"S5:m/w": threading.Event()}, []
-    signals["S5:m/w"].set()
-    result = Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep, signals=signals,
-                    busy={"S5:m/w": dict(busy)}).run(warm)
+    result = _driver(clock, rp, lines, signals, busy).run(cold[0])
+    loads = [r for r in lines if r["kind"] == "load"]
+    marks = [(r["event"], r["machine_id"]) for r in lines if r.get("event", "").startswith("busy")]
+    return rp, loads, marks, result, signals, busy
+
+
+def test_cold_pull_redeploys_until_it_lands_on_the_seed_machine_and_only_then_marks_it_busy():
+    rp, loads, marks, result, signals, busy = _cold_run(("mA", "mH"))
+    assert result.ok
+    assert [(r["machine_id"], r["co_landed"], r["failure"]) for r in loads] == [
+        ("mA", False, "off_target"), ("mH", True, None)]
+    assert marks == [("busy_on", "mH"), ("busy_off", "mH")]
+    assert signals[BUSY].is_set() and busy[BUSY] == {}
+    assert len(rp.created) == 2 and sorted(rp.deleted) == ["ep1", "ep2"]
+
+
+def test_cold_pull_off_the_seed_machine_on_its_last_try_runs_but_never_marks_busy():
+    rp, loads, marks, result, signals, _ = _cold_run(("mA",))
+    assert result.ok
+    assert [(r["co_landed"], r["failure"]) for r in loads] == [
+        (False, "off_target"), (False, "off_target"), (False, None)]
+    assert marks == [] and BUSY not in signals
+
+
+def _warm_run(machines, cold_busy):
+    warm, *_ = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1"], warm="m/w")
+    clock, lines = FakeClock(), []
+    rp = FakeRunpod(clock, machines=machines)
+    result = _driver(clock, rp, lines, _set(BUSY), {BUSY: dict(cold_busy)}).run(warm)
     return rp, [r for r in lines if r["kind"] == "load"], result
 
 
-def test_warm_seed_redeploys_until_it_lands_on_a_cold_pull_machine():
-    rp, loads, result = _warm_run(("mA", "mA", "mB"), {"coldpod": "mB"})
+def test_warm_measure_redeploys_until_it_lands_where_a_cold_pull_is_staging():
+    rp, loads, result = _warm_run(("mH", "mA", "mH"), {"coldpod": "mH"})
     assert result.ok
     assert [(r["role"], r["machine_id"], r["co_landed"], r["attempt"]) for r in loads] == [
-        ("seed", "mA", False, 1), ("seed", "mA", False, 2), ("seed", "mB", True, 3), ("measure", "mB", True, 1)]
-    assert [r["failure"] for r in loads] == ["off_target", "off_target", None, None]
-    # each miss is torn down and redeployed on a fresh endpoint; nothing is left behind
-    assert rp.created == [f"msc-camtl1-s5warm-a40-t1{s}" for s in ("", "-1", "-2", "-3")]
-    assert sorted(rp.deleted) == ["ep1", "ep2", "ep3", "ep4"]
+        ("seed", "mH", None, 1), ("measure", "mA", False, 1), ("measure", "mH", True, 2)]
+    assert [r["failure"] for r in loads] == [None, "off_target", None]
+    assert len(rp.created) == 3 and sorted(rp.deleted) == ["ep1", "ep2", "ep3"]
 
 
-def test_warm_seed_gives_up_after_three_tries_and_records_not_co_landed():
-    rp, loads, result = _warm_run(("mA",), {"coldpod": "mB"})
+def test_warm_measure_gives_up_after_three_tries_and_records_not_co_landed():
+    rp, loads, result = _warm_run(("mH", "mA"), {"coldpod": "mH2"})
     assert result.ok
     assert [(r["role"], r["co_landed"], r["failure"]) for r in loads] == [
-        ("seed", False, "off_target"), ("seed", False, "off_target"), ("seed", False, None), ("measure", False, None)]
-    assert len(rp.created) == 4 and len(rp.deleted) == 4
+        ("seed", None, None), ("measure", False, "off_target"), ("measure", False, "off_target"),
+        ("measure", False, None)]
+    assert len(rp.created) == len(rp.deleted) == 4
 
 
-def test_cold_load_marks_its_machine_busy_until_staging_ends_and_releases_the_warm_arm():
-    _, *cold = spec.s5(dc="CA-MTL-1", gpu="a40", cold=["m/c1"], warm="m/w")
-    clock = FakeClock()
-    rp = FakeRunpod(clock, machines=("mB",))
-    signals, busy, lines = {}, {}, []
-    Driver(rp, run_id="t1", sink=lines.append, now=clock.now, sleep=clock.sleep, signals=signals,
-           busy=busy).run(cold[0])
-    assert signals["S5:m/w"].is_set()
-    ev = [(r["event"], r.get("machine_id")) for r in lines if r.get("event", "").startswith("busy")]
-    assert ev == [("busy_on", "mB"), ("busy_off", "mB")]
-    assert busy["S5:m/w"] == {}
+def test_deploy_timeout_override_lets_a_long_queued_load_finish():
+    def sc(**kw):
+        return spec.Scenario("S5", "cold1", "CA-MTL-1", "a40", "m/c1", (spec.Deploy("cold", 60, **kw),))
+    run_s = spec.ROUND_TIMEOUT_S + 300
+    _, _, short, _ = _run(sc(), run_s=run_s)
+    _, _, long_, _ = _run(sc(timeout_s=spec.S5_ROUND_TIMEOUT_S), run_s=run_s)
+    assert not short.ok and "timeout" in short.reason
+    assert long_.ok

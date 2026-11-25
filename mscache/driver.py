@@ -45,11 +45,12 @@ class _Stop(Exception):
 
 
 class _Watch:
-    """One load's per-poll side effects: the S4 signal, S5 busy marking and S5 co-land targeting."""
+    """One load's per-poll side effects: the S4 signal, S5 seed pin, co-land targeting and busy marking."""
 
     def __init__(self, drv: "Driver", d: spec.Deploy, abort_off_target: bool):
         self.drv, self.d, self.abort = drv, d, abort_off_target
         self.marked: dict[str, str] = {}   # pod id -> machine, while this load is busy under d.busy
+        self.pinned: set[str] = set()      # pod ids recorded under d.pin (never released)
         self.released = False
         self.co_landed: bool | None = None
         self.placed: dict = {}   # the pod co_landed was judged on (an aborted job has no workerId)
@@ -60,17 +61,31 @@ class _Watch:
             self.drv._set(self.d.signal)
         placed = sorted((p for p in seen.values() if p.get("machineId")),
                         key=lambda p: phases.epoch(p.get("createdAt")) or 0)
-        if self.d.busy and not self.released:
+        if self.d.pin:
             for p in placed:
-                self._mark(p["id"], p["machineId"])
+                self._pin(p["id"], p["machineId"])
             if running:
-                self.release()
+                self.drv._set(self.d.pin)
         if self.d.co_land and placed and self.co_landed is None:
             self.placed = placed[0]
             self.co_landed = self.placed["machineId"] in self.drv._busy_machines(self.d.co_land)
             if not self.co_landed and self.abort:
                 return OFF_TARGET
+        # a targeted load that missed its target (last try) stages elsewhere: not busy where it matters
+        if self.d.busy and not self.released and self.co_landed is not False:
+            for p in placed:
+                self._mark(p["id"], p["machineId"])
+            if running:
+                self.release()
         return None
+
+    def _pin(self, pid: str, machine: str) -> None:
+        if pid in self.pinned:
+            return
+        with _BUSY_LOCK:
+            self.drv.busy.setdefault(self.d.pin, {})[pid] = machine
+        self.pinned.add(pid)
+        self.drv._event("pin", tag=self.d.pin, pod_id=pid, machine_id=machine)
 
     def _mark(self, pid: str, machine: str) -> None:
         if pid in self.marked:
@@ -98,7 +113,7 @@ class Driver:
                  busy: dict[str, dict[str, str]] | None = None):
         self.rp, self.run_id, self.sink, self.now, self.sleep = client, run_id, sink, now, sleep
         # both shared by every Driver of one run, so S4/S5 arms on separate endpoints can line up:
-        # signals by tag; busy = tag -> {pod id: machine} of loads still staging (S5 cold pulls)
+        # signals by tag; busy = tag -> {pod id: machine}: S5 cold pulls still staging, or the S5 seed's pin
         self.signals = {} if signals is None else signals
         self.busy = {} if busy is None else busy
 
@@ -256,7 +271,7 @@ class Driver:
         jid = self.rp.submit(ep, {"hold_s": d.hold_s})
         watch = _Watch(self, d, abort_off_target)
         try:
-            status, seen, failure = self._poll(ep, jid, submitted, stale, watch)
+            status, seen, failure = self._poll(ep, jid, submitted, stale, watch, d.timeout_s)
         finally:
             watch.release()   # a stopped or failed cold load must not stay busy for the warm arm
         wid = status.get("workerId") or ""
@@ -285,7 +300,8 @@ class Driver:
         return rec
 
     def _poll(self, ep: str, jid: str, submitted: float, stale: set[str],
-              watch: Callable[[dict, dict], str | None]) -> tuple[dict, dict, str | None]:
+              watch: Callable[[dict, dict], str | None],
+              timeout_s: float = spec.ROUND_TIMEOUT_S) -> tuple[dict, dict, str | None]:
         """(final status, this load's pods by id, failure or None). `watch` sees every poll and may abort."""
         seen: dict[str, dict] = {}
         clocks = {"live": None, "throttled": None}   # first-seen times; live None = nothing placed yet
@@ -301,7 +317,7 @@ class Driver:
                 return status, seen, None if status["status"] == "COMPLETED" else "job_" + status["status"].lower()
             t = self.now()
             self._tick(clocks, t, seen, self.rp.workers(ep))
-            failure = self._failure(t, submitted, clocks)
+            failure = self._failure(t, submitted, clocks, timeout_s)
             if failure:
                 self.rp.cancel(ep, jid)
                 return {**status, "status": "CANCELLED"}, seen, failure
@@ -319,13 +335,13 @@ class Driver:
             clocks["throttled"] = None
 
     @staticmethod
-    def _failure(t: float, submitted: float, clocks: dict) -> str | None:
+    def _failure(t: float, submitted: float, clocks: dict, timeout_s: float) -> str | None:
         if clocks["live"] is None and t - submitted > spec.ABANDON_S:
             return "no_worker"
         if clocks["throttled"] is not None and t - clocks["throttled"] > spec.THROTTLE_S:
             return "throttled"
         if clocks["live"] is not None and clocks["throttled"] is None and t - clocks["live"] > spec.STALL_S:
             return "stall"
-        if t - submitted > spec.ROUND_TIMEOUT_S:
+        if t - submitted > timeout_s:
             return "timeout"
         return None
